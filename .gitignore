@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# uv
+# (uv.lock is committed)
+
+# Secrets / local config
+setgeminikey.sh
+setclaimcheck.sh
+setcloudenv.sh
+.env
+
+# OS
+.DS_Store
+
+
+# IDE
+./.idea/

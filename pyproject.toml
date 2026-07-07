@@ -1,0 +1,39 @@
+[project]
+name = "strands-wealth-management"
+version = "0.1.0"
+description = "Strands Agents Wealth Management Demo (with an optional Temporal durable-execution version)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "strands-agents[gemini]>=1.0.0",
+    "strands-agents-tools>=0.1.0",
+    "temporalio[strands-agents]>=1.28.0",
+    "redis>=5.0.0",
+    "python-dotenv>=1.0.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+]
+
+[project.scripts]
+strands-supervisor = "strands_supervisor.main:main"
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/strands_supervisor", "src/common", "src/temporal_supervisor", "src/api"]
