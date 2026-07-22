@@ -29,12 +29,12 @@ The vanilla Strands (CLI) version of this example is located [here](../strands_s
         │  delegates to specialized sub-agents (Strands "agents as tools";
         │  every model + tool call runs as an Activity, persisted to Redis):
         ├──▶ beneficiary agent    (list / add / delete)
-        ├──▶ investment agent     (list / close)
-        └──▶ open-account agent   (persistent; drives the child workflow below)
-                  │ start child
-                  ▼
-        OpenInvestmentAccountWorkflow
-              Waiting KYC → Waiting Compliance Review → Complete
+        └──▶ investment agent     (list / close; owns opening, delegates it onward)
+                  └──▶ open-account agent   (persistent; drives the child workflow below)
+                            │ start child
+                            ▼
+                  OpenInvestmentAccountWorkflow
+                        Waiting KYC → Waiting Compliance Review → Complete
 ```
 
 The React frontend uses adaptive polling (2s while awaiting the assistant, 5s
@@ -46,7 +46,7 @@ updates as the open-account child workflow progresses.
 | Temporal feature | Where |
 |---|---|
 | **Durable model + tool calls** | `TemporalAgent` in `workflows/supervisor_workflow.py` |
-| **Agents as tools** | The supervisor delegates to `beneficiary_assistant` / `investment_assistant` / `open_account_assistant` sub-agents (`_make_*_assistant`) |
+| **Agents as tools (nested)** | The supervisor delegates to `beneficiary_assistant` / `investment_assistant`; the investment agent delegates opening onward to `open_account_assistant` (`_make_*_assistant`) |
 | **Tools as Activities** | `activities/` wrapped with `activity_as_tool` |
 | **Child workflow** | The open-account agent starts `OpenInvestmentAccountWorkflow` |
 | **Human approval gate** | `ApprovalHook` interrupts before `delete_beneficiary` / `close_investment`; UI shows Approve/Deny |
@@ -59,21 +59,24 @@ updates as the open-account child workflow progresses.
 The ADK version uses ADK `sub_agents` with automatic LLM "transfer". Strands has
 no transfer primitive, so this version uses the Strands
 ["agents as tools"](https://strandsagents.com/latest/documentation/docs/user-guide/concepts/multi-agent/agents-as-tools/)
-pattern: a supervisor `TemporalAgent` orchestrates and delegates each request to a
-specialized sub-agent — itself a `TemporalAgent` — exposed to it as a tool:
-`beneficiary_assistant`, `investment_assistant`, and `open_account_assistant` (see
-`_make_*_assistant` in `workflows/supervisor_workflow.py`). The `StrandsPlugin`
-routes every model invocation and tool call through Activities, so each sub-agent's
-work is durably recorded in the workflow history. Delegation is one-directional
-(supervisor → specialist); a specialist never calls back up.
+pattern, nested two levels deep: a supervisor `TemporalAgent` delegates each request
+to a specialized sub-agent — itself a `TemporalAgent` — exposed to it as a tool
+(`beneficiary_assistant`, `investment_assistant`). The **investment agent** in turn
+owns account-opening and delegates it onward to a third sub-agent,
+`open_account_assistant` (see `_make_*_assistant` in
+`workflows/supervisor_workflow.py`). The `StrandsPlugin` routes every model
+invocation and tool call through Activities, so each sub-agent's work is durably
+recorded in the workflow history. Delegation is one-directional (caller → specialist);
+a specialist never calls back up.
 
 The beneficiary and investment agents are rebuilt per request, but the
 **open-account agent is persistent**: it is built once and reused across customer
 turns (its message history is even carried across Continue-as-New) so it can hold
 the open-account child-workflow ID while it walks the customer through KYC and waits
-for compliance review. Opening an account is therefore owned by this dedicated agent,
-which drives the durable `OpenInvestmentAccountWorkflow` child workflow, rather than
-by the supervisor directly.
+for compliance review — regardless of which agent invokes it, since it is keyed on
+the workflow, not the caller. Opening an account is therefore owned by this dedicated
+agent, which drives the durable `OpenInvestmentAccountWorkflow` child workflow, and
+is reached via the investment agent rather than from the supervisor directly.
 
 The scenarios are identical to the ADK demo; only the internal topology differs to
 fit the Strands + Temporal integration. The CLI-only

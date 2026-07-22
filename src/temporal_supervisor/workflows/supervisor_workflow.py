@@ -273,9 +273,11 @@ class WealthManagementWorkflow:
     def _make_investment_assistant(self):
         @tool(context=True)
         async def investment_assistant(client_id: str, request: str, tool_context: ToolContext) -> str:
-            """Handle an investment-account request to list or close investment accounts.
+            """Handle any investment-account request: list, close, or open an account.
 
-            (Opening a new account is handled by the supervisor, not this tool.)
+            Listing and closing are handled directly; opening a new account is delegated
+            onward to the persistent open-account agent (open_account_assistant), which
+            drives the durable KYC + compliance flow.
 
             Args:
                 client_id: The customer's client ID.
@@ -292,6 +294,9 @@ class WealthManagementWorkflow:
                 tools=[
                     activity_as_tool(Investments.list_investments, start_to_close_timeout=ACTIVITY_TIMEOUT),
                     activity_as_tool(Investments.close_investment, start_to_close_timeout=ACTIVITY_TIMEOUT),
+                    # Nested delegate: the investment agent owns account-opening and
+                    # hands it to the dedicated open-account agent.
+                    self._make_open_account_assistant(),
                 ],
             )
 
@@ -346,10 +351,11 @@ class WealthManagementWorkflow:
                 retry_policy=self.retry_policy,
             )
 
-        # The supervisor is a pure orchestrator: it delegates beneficiary,
-        # investment, and open-account requests to specialized sub-agents (see
-        # _make_*_assistant). The open-account agent is persistent and drives the
-        # durable child workflow itself. The approval gate lives on the sub-agents.
+        # The supervisor is a pure orchestrator: it delegates beneficiary and
+        # investment requests to specialized sub-agents (see _make_*_assistant).
+        # Opening an account is nested one level deeper — the investment agent
+        # owns it and delegates onward to the persistent open-account agent, which
+        # drives the durable child workflow. The approval gate lives on the sub-agents.
         self._agent = TemporalAgent(
             model=MODEL_NAME,
             start_to_close_timeout=timedelta(seconds=90),
@@ -358,7 +364,6 @@ class WealthManagementWorkflow:
             tools=[
                 self._make_beneficiary_assistant(),
                 self._make_investment_assistant(),
-                self._make_open_account_assistant(),
             ],
             messages=list(chat_input.messages),
         )
