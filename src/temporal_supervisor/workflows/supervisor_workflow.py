@@ -69,6 +69,21 @@ class ApprovalHook(HookProvider):
 # ---------------------------------------------------------------------------
 # In-workflow tools (run deterministically in the workflow sandbox).
 # ---------------------------------------------------------------------------
+def _slugify(name: str) -> str:
+    """Deterministically reduce a name to a URL/CLI-safe slug for use in IDs.
+
+    The account name is embedded in the child workflow ID for readability, but a
+    raw name can contain spaces or other characters that are awkward to pass on a
+    command line or in a URL. This keeps only alphanumerics, collapses everything
+    else to single hyphens, and caps the length. Pure/deterministic (no I/O), so
+    it is safe to call from workflow context.
+    """
+    slug = "".join(c if (c.isascii() and c.isalnum()) else "-" for c in name.lower())
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug.strip("-")[:40] or "account"
+
+
 @tool
 async def open_new_investment_account(client_id: str, account_name: str, initial_amount: float) -> str:
     """Begin opening a new investment account via a durable child workflow.
@@ -84,7 +99,9 @@ async def open_new_investment_account(client_id: str, account_name: str, initial
     account_input = OpenInvestmentAccountInput(
         client_id=client_id, account_name=account_name, initial_amount=initial_amount
     )
-    child_workflow_id = f"open-account-{workflow.info().workflow_id}-{account_name}-{workflow.uuid4()}"
+    # Slugify the account name for the ID only; the account keeps its real name
+    # via account_input above.
+    child_workflow_id = f"open-account-{workflow.info().workflow_id}-{_slugify(account_name)}-{workflow.uuid4()}"
     await workflow.start_child_workflow(
         OpenInvestmentAccountWorkflow.run,
         account_input,
