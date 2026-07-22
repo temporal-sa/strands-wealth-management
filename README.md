@@ -28,22 +28,27 @@ Scenarios currently implemented include:
 A **Supervisor** agent talks to the customer and routes each request to a specialist:
 
 ```
-                ┌─────────────────────┐
-   customer ──▶ │   Supervisor Agent  │
-                └──────────┬──────────┘
-                  delegates │ (with client_id)
-            ┌──────────────┴───────────────┐
-            ▼                               ▼
-  ┌───────────────────┐          ┌────────────────────┐
-  │ Beneficiary Agent │          │  Investment Agent   │
-  │  list / add /     │          │  list / open /      │
-  │  delete           │          │  close              │
-  └───────────────────┘          └────────────────────┘
+                    ┌─────────────────────┐
+       customer ──▶ │   Supervisor Agent  │
+                    └──────────┬──────────┘
+                      delegates │ (with client_id)
+        ┌──────────────────────┼──────────────────────┐
+        ▼                      ▼                       ▼
+┌───────────────────┐ ┌───────────────────┐ ┌──────────────────────┐
+│ Beneficiary Agent │ │  Investment Agent │ │  Open Account Agent   │
+│  list / add /     │ │  list / close     │ │  open a new account   │
+│  delete           │ │  (open *)         │ │  (Temporal only)      │
+└───────────────────┘ └───────────────────┘ └──────────────────────┘
 ```
 
-In the Temporal version, opening an investment account is handled by an
-**Open Account** child workflow that gates on KYC and a human compliance-approval
-signal before creating the account.
+In the **Temporal** version, opening an investment account is delegated to a
+dedicated **Open Account Agent** that drives an `OpenInvestmentAccountWorkflow`
+child workflow, gating on KYC and a human compliance-approval signal before
+creating the account.
+
+In the **Strands-only** (CLI) version there is no separate Open Account Agent:
+opening (`*`) is a single synchronous tool inside the Investment Agent, so that
+agent does list / open / close.
 
 ## Prerequisites
 

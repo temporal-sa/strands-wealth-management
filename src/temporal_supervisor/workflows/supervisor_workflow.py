@@ -12,6 +12,7 @@ from common.status_update import StatusUpdate
 from common.account_context import UpdateAccountOpeningStateInput
 from common.agent_constants import (
     BENE_INSTRUCTIONS,
+    OPEN_ACCOUNT_INSTRUCTIONS,
     TEMPORAL_INVEST_SUBAGENT_INSTRUCTIONS,
     TEMPORAL_SUPERVISOR_INSTRUCTIONS,
 )
@@ -138,6 +139,10 @@ class ChatInput:
     """Carried across continue-as-new so the conversation survives history resets."""
     messages: list = field(default_factory=list)
     history: List[ChatInteraction] = field(default_factory=list)
+    # The persistent open-account agent's own message history (see
+    # _make_open_account_assistant); carried so a multi-turn account-opening flow
+    # survives a continue-as-new mid-flight.
+    open_account_messages: list = field(default_factory=list)
 
 
 @workflow.defn
@@ -157,6 +162,12 @@ class WealthManagementWorkflow:
         # entry mid-turn (while an approval is pending); empty between turns, so it
         # does not need to be carried across continue-as-new.
         self._subagents: dict = {}
+        # Long-lived sub-agents that must own multi-turn state (the open-account
+        # agent owns its child-workflow ID), keyed by a stable name rather than by
+        # tool_use id so the same agent is reused across supervisor turns. Their
+        # message history IS carried across continue-as-new; see run().
+        self._persistent_subagents: dict = {}
+        self._persistent_seed_messages: dict = {}
         self.local_to_close_timeout = timedelta(seconds=10)
         self.retry_policy = RetryPolicy(
             initial_interval=timedelta(seconds=1),
@@ -173,6 +184,7 @@ class WealthManagementWorkflow:
         request: str,
         system_prompt: str,
         tools: list,
+        persistent_key: Optional[str] = None,
     ) -> str:
         """Build/reuse a specialized sub-agent and run it, propagating approvals.
 
@@ -182,19 +194,34 @@ class WealthManagementWorkflow:
         stop_reason == "interrupt". So we re-raise it on the supervisor via
         ``tool_context.interrupt`` (which surfaces to the workflow's approval loop)
         and, on resume, feed the human's decision back down to the *same*
-        sub-agent. The sub-agent is persisted in ``self._subagents`` across the
-        raise/resume; the supervisor's tool_use id is a stable, deterministic key.
+        sub-agent. The in-flight sub-agent is persisted in ``self._subagents``
+        across the raise/resume; the supervisor's tool_use id is a stable,
+        deterministic key.
+
+        When ``persistent_key`` is given, the sub-agent is also long-lived: it is
+        built once and reused across supervisor turns (from
+        ``self._persistent_subagents``) so it can own multi-turn state such as the
+        open-account child-workflow ID. Ordinary sub-agents are rebuilt per call.
         """
         key = tool_context.tool_use["toolUseId"]
         if key not in self._subagents:
-            sub = TemporalAgent(
-                model=MODEL_NAME,
-                start_to_close_timeout=timedelta(seconds=90),
-                retry_policy=RetryPolicy(maximum_attempts=3),
-                system_prompt=system_prompt,
-                tools=tools,
-                hooks=[ApprovalHook()],
-            )
+            if persistent_key is not None and persistent_key in self._persistent_subagents:
+                # A later turn of a multi-turn flow: reuse the same agent so its
+                # message history (and the child-workflow ID it holds) carries over.
+                sub = self._persistent_subagents[persistent_key]
+            else:
+                seed = self._persistent_seed_messages.pop(persistent_key, []) if persistent_key else []
+                sub = TemporalAgent(
+                    model=MODEL_NAME,
+                    start_to_close_timeout=timedelta(seconds=90),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                    system_prompt=system_prompt,
+                    tools=tools,
+                    hooks=[ApprovalHook()],
+                    messages=seed,
+                )
+                if persistent_key is not None:
+                    self._persistent_subagents[persistent_key] = sub
             sub_result = await sub.invoke_async(f"The client ID is {client_id}. {request}")
             self._subagents[key] = [sub, sub_result]
         else:
@@ -270,10 +297,46 @@ class WealthManagementWorkflow:
 
         return investment_assistant
 
+    def _make_open_account_assistant(self):
+        @tool(context=True)
+        async def open_account_assistant(client_id: str, request: str, tool_context: ToolContext) -> str:
+            """Open a new investment account (a multi-step, durable KYC + compliance flow).
+
+            This delegates to a persistent open-account agent that drives the durable
+            child workflow across several customer turns, so relay whatever the customer
+            said (the account name and initial amount, a confirmation that their details
+            are correct, or which details to change) and relay the agent's reply back.
+
+            Args:
+                client_id: The customer's client ID.
+                request: A natural-language description of what the customer wants done
+                    with respect to opening the account.
+
+            Returns:
+                The open-account agent's response.
+            """
+            return await self._run_subagent(
+                tool_context=tool_context,
+                client_id=client_id,
+                request=request,
+                system_prompt=OPEN_ACCOUNT_INSTRUCTIONS,
+                tools=[
+                    open_new_investment_account,
+                    activity_as_tool(OpenAccount.get_current_client_info, start_to_close_timeout=ACTIVITY_TIMEOUT),
+                    activity_as_tool(OpenAccount.approve_kyc, start_to_close_timeout=ACTIVITY_TIMEOUT),
+                    update_client_details,
+                ],
+                persistent_key="open_account",
+            )
+
+        return open_account_assistant
+
     @workflow.run
     async def run(self, chat_input: ChatInput = ChatInput()) -> None:
         self.wf_id = workflow.info().workflow_id
         self.chat_history = list(chat_input.history)
+        if chat_input.open_account_messages:
+            self._persistent_seed_messages["open_account"] = list(chat_input.open_account_messages)
 
         if workflow.info().continued_run_id is None:
             await workflow.execute_local_activity(
@@ -283,9 +346,10 @@ class WealthManagementWorkflow:
                 retry_policy=self.retry_policy,
             )
 
-        # The supervisor delegates beneficiary/investment CRUD to specialized
-        # sub-agents (see _make_*_assistant) and owns the durable open-account
-        # flow directly. The approval gate lives on the sub-agents, not here.
+        # The supervisor is a pure orchestrator: it delegates beneficiary,
+        # investment, and open-account requests to specialized sub-agents (see
+        # _make_*_assistant). The open-account agent is persistent and drives the
+        # durable child workflow itself. The approval gate lives on the sub-agents.
         self._agent = TemporalAgent(
             model=MODEL_NAME,
             start_to_close_timeout=timedelta(seconds=90),
@@ -294,10 +358,7 @@ class WealthManagementWorkflow:
             tools=[
                 self._make_beneficiary_assistant(),
                 self._make_investment_assistant(),
-                open_new_investment_account,
-                activity_as_tool(OpenAccount.get_current_client_info, start_to_close_timeout=ACTIVITY_TIMEOUT),
-                activity_as_tool(OpenAccount.approve_kyc, start_to_close_timeout=ACTIVITY_TIMEOUT),
-                update_client_details,
+                self._make_open_account_assistant(),
             ],
             messages=list(chat_input.messages),
         )
@@ -322,8 +383,15 @@ class WealthManagementWorkflow:
 
             if workflow.info().is_continue_as_new_suggested():
                 await workflow.wait_condition(workflow.all_handlers_finished)
+                open_account_agent = self._persistent_subagents.get("open_account")
                 workflow.continue_as_new(
-                    ChatInput(messages=self._agent.messages, history=self.chat_history)
+                    ChatInput(
+                        messages=self._agent.messages,
+                        history=self.chat_history,
+                        open_account_messages=(
+                            open_account_agent.messages if open_account_agent else []
+                        ),
+                    )
                 )
 
     async def _process_chat_message(self, message: str) -> None:

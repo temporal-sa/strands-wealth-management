@@ -66,11 +66,11 @@ SUPERVISOR_INSTRUCTIONS = """You are a helpful wealth management assistant. You 
 # "agents as tools" topology as the Strands version), so BENE_INSTRUCTIONS above
 # is shared verbatim by both versions' beneficiary agents. The only intentional
 # divergence is opening an account, which in the Temporal version is a durable,
-# multi-step child-workflow flow owned by the supervisor (see below) rather than
-# a single synchronous tool call.
+# multi-step child-workflow flow owned by a dedicated open-account agent (see
+# OPEN_ACCOUNT_INSTRUCTIONS below) rather than a single synchronous tool call.
 TEMPORAL_INVEST_SUBAGENT_INSTRUCTIONS = """You are an investment agent. You were likely delegated to from the supervisor agent.
     You are responsible for listing and closing investment accounts. Opening a new account is handled by
-    the supervisor, not by you.
+    a separate open-account agent, not by you.
 
     Follow these steps every time:
 
@@ -101,29 +101,24 @@ TEMPORAL_SUPERVISOR_INSTRUCTIONS = """You are a helpful wealth management assist
     Delegate to the appropriate specialized agent tool, ALWAYS passing the client ID:
     - Beneficiary requests (list/add/delete beneficiaries): call the beneficiary_assistant tool.
     - Investment requests to list or close accounts: call the investment_assistant tool.
+    - Opening a new investment account: call the open_account_assistant tool.
     Relay the specialized agent's answer back to the customer. Do not invent data — only report what the tools return.
     Some actions (deleting a beneficiary, closing an account) require human approval; if an action was denied,
     tell the customer it was not completed.
 
     # Opening a new investment account
-    Opening an account is a multi-step, durable process handled here directly (not by investment_assistant).
-    Follow this routine:
-    1. You need an account name and an initial amount. Then call open_new_investment_account.
-       Save the returned workflow ID — the other open-account tools require it.
-    2. Call get_current_client_info with that workflow ID. Show the customer their current details and ask
-       if the information is correct and up to date.
-       - If correct, call approve_kyc.
-       - If not, ask which fields to change, then call update_client_details with only those fields.
-    3. Tell the customer the account is now waiting for compliance review, which is performed by a human
-       and may take a moment. The account will be created automatically once compliance approves.
-    Always relay tool results truthfully and concisely. Never invent account data."""
+    Opening an account is a multi-step, durable process owned by the open_account_assistant tool, which
+    collects the account name and initial amount, confirms the customer's details for KYC, and waits for a
+    human compliance review. On every customer turn about opening an account, call open_account_assistant,
+    passing the client ID and what the customer said, and relay its response. Do NOT drive the opening
+    steps yourself — the open-account agent tracks its own progress across turns."""
 
 # Open Account Constants (used by the Temporal version's child workflow)
 OPEN_ACCOUNT_AGENT_NAME = "Open Account Agent"
 OPEN_ACCOUNT_HANDOFF = "A helpful agent that can open a new investment account."
 OPEN_ACCOUNT_INSTRUCTIONS = f"""You are a helpful agent. You can use your tools to open a new investment account and check
     the status of a newly opened investment account. If you are talking to a customer, you were
-    likely delegated to from the {INVEST_AGENT_NAME}.
+    likely delegated to from the {SUPERVISOR_AGENT_NAME}.
     You are responsible for handling the opening of a new investment account. This is the only operation
     you can do — open a new investment account.
     # Routine
