@@ -27,26 +27,7 @@ Scenarios currently implemented include:
 
 A **Supervisor** agent talks to the customer and routes each request to a specialist:
 
-```
-                ┌─────────────────────┐
-   customer ──▶ │   Supervisor Agent  │
-                └──────────┬──────────┘
-                  delegates │ (with client_id)
-            ┌──────────────┴───────────────┐
-            ▼                               ▼
-  ┌───────────────────┐          ┌───────────────────┐
-  │ Beneficiary Agent │          │  Investment Agent │
-  │  list / add /     │          │  list / close     │
-  │  delete           │          │  (open *)         │
-  └───────────────────┘          └─────────┬─────────┘
-                                  delegates │ (opening only)
-                                            ▼
-                                 ┌──────────────────────┐
-                                 │  Open Account Agent   │
-                                 │  open a new account   │
-                                 │  (Temporal only)      │
-                                 └──────────────────────┘
-```
+![](images/agent-architecture.png)
 
 In the **Temporal** version, opening an investment account is delegated by the
 Investment Agent to a dedicated **Open Account Agent** that drives an

@@ -13,29 +13,7 @@ The vanilla Strands (CLI) version of this example is located [here](../strands_s
 
 ## Application architecture
 
-```
-  React UX (src/frontend)
-        │  REST + adaptive polling
-        ▼
-  FastAPI (src/api)  ── start / send-prompt / end-chat
-        │             ── get-chat-history (reads Redis)
-        │             ── pending-approval + approve   (delete/close gate)
-        │             ── pending-compliance + approve-compliance
-        ▼
-  Temporal worker (src/temporal_supervisor)
-        │
-  WealthManagementWorkflow
-        │  supervisor TemporalAgent (model="gemini") — pure orchestrator
-        │  delegates to specialized sub-agents (Strands "agents as tools";
-        │  every model + tool call runs as an Activity, persisted to Redis):
-        ├──▶ beneficiary agent    (list / add / delete)
-        └──▶ investment agent     (list / close; owns opening, delegates it onward)
-                  └──▶ open-account agent   (persistent; drives the child workflow below)
-                            │ start child
-                            ▼
-                  OpenInvestmentAccountWorkflow
-                        Waiting KYC → Waiting Compliance Review → Complete
-```
+![](../../images/application-architecture.png)
 
 The React frontend uses adaptive polling (2s while awaiting the assistant, 5s
 otherwise) to read new events from Redis via the API, giving real-time status
