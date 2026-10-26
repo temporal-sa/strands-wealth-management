@@ -5,6 +5,7 @@ from typing import List, Optional
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.workflow import ParentClosePolicy
 
 from common.user_message import ProcessUserMessageInput, ChatInteraction
@@ -16,8 +17,8 @@ from common.agent_constants import (
     TEMPORAL_INVEST_SUBAGENT_INSTRUCTIONS,
     TEMPORAL_SUPERVISOR_INSTRUCTIONS,
 )
-from temporal_supervisor.model_config import MODEL_NAME
 from temporal_supervisor.activities.event_stream_activities import EventStreamActivities
+from temporal_supervisor.retry_policies import LLM_RETRY_POLICY, TOOL_RETRY_POLICY
 
 with workflow.unsafe.imports_passed_through():
     from strands import tool
@@ -25,6 +26,7 @@ with workflow.unsafe.imports_passed_through():
     from strands.types.tools import ToolContext
     from temporalio.contrib.strands import TemporalAgent
     from temporalio.contrib.strands.workflow import activity_as_tool
+    from temporal_supervisor.model_config import LLM_TASK_QUEUE, MODEL_NAME
     from temporal_supervisor.activities.beneficiaries import Beneficiaries
     from temporal_supervisor.activities.investments import Investments
     from temporal_supervisor.activities.open_account import OpenAccount
@@ -35,6 +37,13 @@ with workflow.unsafe.imports_passed_through():
     )
 
 ACTIVITY_TIMEOUT = timedelta(seconds=30)
+MODEL_TIMEOUT = timedelta(seconds=90)
+
+
+def _activity_tool(activity_fn):
+    """Expose an activity to an agent as a tool, retrying until its system recovers."""
+    return activity_as_tool(activity_fn, start_to_close_timeout=ACTIVITY_TIMEOUT, retry_policy=TOOL_RETRY_POLICY)
+
 
 # Tools that mutate state and therefore require human approval before running.
 APPROVAL_REQUIRED_TOOLS = {"delete_beneficiary", "close_investment"}
@@ -94,10 +103,37 @@ async def open_new_investment_account(client_id: str, account_name: str, initial
         initial_amount: The initial deposit amount.
 
     Returns:
-        The child workflow ID, which the other open-account tools require.
+        The child workflow ID, which the other open-account tools require, or
+        the reason the account cannot be opened.
     """
+    # Business rules are checked up front. A violation is a non-retryable error:
+    # it fails on the first attempt, and the reason goes back to the agent.
+    try:
+        await workflow.execute_activity(
+            Investments.validate_new_account,
+            args=[client_id, account_name, initial_amount],
+            start_to_close_timeout=ACTIVITY_TIMEOUT,
+            retry_policy=TOOL_RETRY_POLICY,
+        )
+    except ActivityError as e:
+        # Strands only shows the model str(error), which for an ActivityError is
+        # "Activity task failed"; pass the business reason through instead.
+        if isinstance(e.__cause__, ApplicationError):
+            return f"The account cannot be opened: {e.__cause__.message}"
+        raise
+
+    # Read in an activity so the result is recorded in history and replays the same.
+    promo_code = await workflow.execute_activity(
+        Investments.find_promotion,
+        client_id,
+        start_to_close_timeout=ACTIVITY_TIMEOUT,
+        retry_policy=TOOL_RETRY_POLICY,
+    )
     account_input = OpenInvestmentAccountInput(
-        client_id=client_id, account_name=account_name, initial_amount=initial_amount
+        client_id=client_id,
+        account_name=account_name,
+        initial_amount=initial_amount,
+        promo_code=promo_code,
     )
     # Slugify the account name for the ID only; the account keeps its real name
     # via account_input above.
@@ -148,6 +184,7 @@ async def update_client_details(
         OpenAccount.update_client_details,
         args=[workflow_id, fields],
         start_to_close_timeout=ACTIVITY_TIMEOUT,
+        retry_policy=TOOL_RETRY_POLICY,
     )
 
 
@@ -230,8 +267,9 @@ class WealthManagementWorkflow:
                 seed = self._persistent_seed_messages.pop(persistent_key, []) if persistent_key else []
                 sub = TemporalAgent(
                     model=MODEL_NAME,
-                    start_to_close_timeout=timedelta(seconds=90),
-                    retry_policy=RetryPolicy(maximum_attempts=3),
+                    task_queue=LLM_TASK_QUEUE,
+                    start_to_close_timeout=MODEL_TIMEOUT,
+                    retry_policy=LLM_RETRY_POLICY,
                     system_prompt=system_prompt,
                     tools=tools,
                     hooks=[ApprovalHook()],
@@ -279,9 +317,9 @@ class WealthManagementWorkflow:
                 request=request,
                 system_prompt=BENE_INSTRUCTIONS,
                 tools=[
-                    activity_as_tool(Beneficiaries.list_beneficiaries, start_to_close_timeout=ACTIVITY_TIMEOUT),
-                    activity_as_tool(Beneficiaries.add_beneficiary, start_to_close_timeout=ACTIVITY_TIMEOUT),
-                    activity_as_tool(Beneficiaries.delete_beneficiary, start_to_close_timeout=ACTIVITY_TIMEOUT),
+                    _activity_tool(Beneficiaries.list_beneficiaries),
+                    _activity_tool(Beneficiaries.add_beneficiary),
+                    _activity_tool(Beneficiaries.delete_beneficiary),
                 ],
             )
 
@@ -309,8 +347,8 @@ class WealthManagementWorkflow:
                 request=request,
                 system_prompt=TEMPORAL_INVEST_SUBAGENT_INSTRUCTIONS,
                 tools=[
-                    activity_as_tool(Investments.list_investments, start_to_close_timeout=ACTIVITY_TIMEOUT),
-                    activity_as_tool(Investments.close_investment, start_to_close_timeout=ACTIVITY_TIMEOUT),
+                    _activity_tool(Investments.list_investments),
+                    _activity_tool(Investments.close_investment),
                     # Nested delegate: the investment agent owns account-opening and
                     # hands it to the dedicated open-account agent.
                     self._make_open_account_assistant(),
@@ -344,8 +382,8 @@ class WealthManagementWorkflow:
                 system_prompt=OPEN_ACCOUNT_INSTRUCTIONS,
                 tools=[
                     open_new_investment_account,
-                    activity_as_tool(OpenAccount.get_current_client_info, start_to_close_timeout=ACTIVITY_TIMEOUT),
-                    activity_as_tool(OpenAccount.approve_kyc, start_to_close_timeout=ACTIVITY_TIMEOUT),
+                    _activity_tool(OpenAccount.get_current_client_info),
+                    _activity_tool(OpenAccount.approve_kyc),
                     update_client_details,
                 ],
                 persistent_key="open_account",
@@ -375,8 +413,9 @@ class WealthManagementWorkflow:
         # drives the durable child workflow. The approval gate lives on the sub-agents.
         self._agent = TemporalAgent(
             model=MODEL_NAME,
-            start_to_close_timeout=timedelta(seconds=90),
-            retry_policy=RetryPolicy(maximum_attempts=3),
+            task_queue=LLM_TASK_QUEUE,
+            start_to_close_timeout=MODEL_TIMEOUT,
+            retry_policy=LLM_RETRY_POLICY,
             system_prompt=TEMPORAL_SUPERVISOR_INSTRUCTIONS,
             tools=[
                 self._make_beneficiary_assistant(),

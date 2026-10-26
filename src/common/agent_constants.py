@@ -119,6 +119,8 @@ OPEN_ACCOUNT_INSTRUCTIONS = f"""You are a helpful agent. You can use your tools 
     2. Use the open_new_investment_account tool to begin the process.
        If the tool requires additional information (account name, initial amount), ask the customer for the required data.
        Save the return value (the workflow ID) as it is required by the other tools.
+       If instead the tool says the account cannot be opened, explain the reason to the customer and stop;
+       do not call any other tools for that request.
     3. Next, check whether the account is waiting for KYC approval.
        Use the get_current_client_info tool to retrieve their current data.
        Display their current data and ask the customer if this information is correct and up to date.

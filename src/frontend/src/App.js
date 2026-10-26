@@ -1,12 +1,22 @@
 import React, { useState, useEffect, useRef } from 'react';
 import './App.css';
 import { API_BASE_URL } from './config';
+import ChaosPanel from './ChaosPanel';
 
 const WORKFLOW_ID_PREFIX = 'strands-temporal-agent-';
 const DEFAULT_HEADER_TEXT = 'Chat session started.';
 // A typed reply to a pending confirmation counts as approval when it starts
 // affirmatively; anything else is treated as a denial.
 const AFFIRMATIVE = /^\s*(y|yes|yeah|yep|sure|ok|okay|approve|confirm|proceed|do it)\b/i;
+const SHOW_CHAOS_KEY = 'showChaosPanel';
+
+function loadShowChaos() {
+  try {
+    return localStorage.getItem(SHOW_CHAOS_KEY) === 'true';
+  } catch (e) {
+    return false;
+  }
+}
 
 function App() {
   const [messages, setMessages] = useState([]);
@@ -16,6 +26,7 @@ function App() {
   const [isPolling, setIsPolling] = useState(false);
   const [isWaitingForAIResponse, setIsWaitingForAIResponse] = useState(false);
   const [pendingApproval, setPendingApproval] = useState(null);
+  const [showChaos, setShowChaos] = useState(loadShowChaos);
 
   const chatWindowRef = useRef(null);
   const eventCountRef = useRef(0);
@@ -134,6 +145,16 @@ function App() {
     setIsChatActive(false);
   };
 
+  const handleToggleChaos = () => {
+    const next = !showChaos;
+    setShowChaos(next);
+    try {
+      localStorage.setItem(SHOW_CHAOS_KEY, String(next));
+    } catch (e) {
+      // Not remembered across reloads; the panel still toggles.
+    }
+  };
+
   const handleToggleChatState = () => {
     if (isChatActive) handleEndChat();
     else handleStartChat();
@@ -221,42 +242,50 @@ function App() {
   };
 
   return (
-    <div className="App">
-      <div className="header">Wealth Management Chatbot · Temporal + Strands</div>
+    <div className="layout">
+      <div className="App">
+        <div className="header">
+          Wealth Management Chatbot · Temporal + Strands
+          <button className="chaos-toggle" onClick={handleToggleChaos}>
+            {showChaos ? 'Hide chaos' : 'Chaos'}
+          </button>
+        </div>
 
-      {statusContent && <div className="status-area">{statusContent}</div>}
+        {statusContent && <div className="status-area">{statusContent}</div>}
 
-      <div className="chat-window" ref={chatWindowRef}>
-        {messages.map((msg, index) => (
-          <div key={index} className={`message ${msg.type}`}>
-            {(msg.text || '').split('\n').map((line, i) => (
-              <span key={i}>
-                {line}
-                <br />
-              </span>
-            ))}
-          </div>
-        ))}
+        <div className="chat-window" ref={chatWindowRef}>
+          {messages.map((msg, index) => (
+            <div key={index} className={`message ${msg.type}`}>
+              {(msg.text || '').split('\n').map((line, i) => (
+                <span key={i}>
+                  {line}
+                  <br />
+                </span>
+              ))}
+            </div>
+          ))}
+        </div>
+
+        <div className="input-area">
+          <input
+            type="text"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyPress={(e) => e.key === 'Enter' && handleSend()}
+            placeholder="Type a message..."
+            disabled={!isChatActive}
+          />
+          <button onClick={handleSend} disabled={!isChatActive}>Send</button>
+        </div>
+
+        <button
+          onClick={handleToggleChatState}
+          className={`end-chat-button ${!isChatActive ? 'start-chat-button' : ''}`}
+        >
+          {isChatActive ? 'End Chat' : 'Start Chat'}
+        </button>
       </div>
-
-      <div className="input-area">
-        <input
-          type="text"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyPress={(e) => e.key === 'Enter' && handleSend()}
-          placeholder="Type a message..."
-          disabled={!isChatActive}
-        />
-        <button onClick={handleSend} disabled={!isChatActive}>Send</button>
-      </div>
-
-      <button
-        onClick={handleToggleChatState}
-        className={`end-chat-button ${!isChatActive ? 'start-chat-button' : ''}`}
-      >
-        {isChatActive ? 'End Chat' : 'Start Chat'}
-      </button>
+      {showChaos && <ChaosPanel />}
     </div>
   );
 }

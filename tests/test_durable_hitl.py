@@ -39,6 +39,7 @@ from strands.types.streaming import StreamEvent
 from strands.types.tools import ToolChoice, ToolSpec
 
 from common.user_message import ProcessUserMessageInput
+from temporal_supervisor.model_config import LLM_TASK_QUEUE
 from temporal_supervisor.workflows.supervisor_workflow import WealthManagementWorkflow, ChatInput
 
 TASK_QUEUE = "test-durable-hitl"
@@ -193,12 +194,14 @@ STUB_ACTIVITIES = [
 async def _run_scenario(env: WorkflowEnvironment, human_response: str) -> dict:
     DELETE_CALLS.clear()
     client = env.client
+    # The plugin registers the model activities on both workers; the agents
+    # schedule them on LLM_TASK_QUEUE.
     async with Worker(
         client,
         task_queue=TASK_QUEUE,
         workflows=[WealthManagementWorkflow],
         activities=STUB_ACTIVITIES,
-    ):
+    ), Worker(client, task_queue=LLM_TASK_QUEUE):
         handle = await client.start_workflow(
             WealthManagementWorkflow.run,
             ChatInput(),
