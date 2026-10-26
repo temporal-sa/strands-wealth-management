@@ -122,6 +122,7 @@ class OpenInvestmentAccountWorkflow:
         """Welcome-bonus promotion: 1% of the initial deposit, up to $500."""
         # Deliberate bug for the "Bug in workflow code" demo; the fix is
         # inputs.initial_amount. See README "Failure scenarios".
+        # return min(inputs.initial_amount * 0.01, 500.0)
         return min(inputs.initial_deposit * 0.01, 500.0)
 
     async def _execute(self, activity_fn, *args):
