@@ -197,6 +197,8 @@ class ChatInput:
     # _make_open_account_assistant); carried so a multi-turn account-opening flow
     # survives a continue-as-new mid-flight.
     open_account_messages: list = field(default_factory=list)
+    # Latest state of each open-account child workflow, keyed by its workflow ID.
+    account_opening_states: dict = field(default_factory=dict)
 
 
 @workflow.defn
@@ -222,6 +224,10 @@ class WealthManagementWorkflow:
         # message history IS carried across continue-as-new; see run().
         self._persistent_subagents: dict = {}
         self._persistent_seed_messages: dict = {}
+        # Latest state reported by each open-account child workflow (see
+        # update_account_opening_state), so the open-account agent can check the
+        # real status instead of relying on what it remembers.
+        self._account_opening_states: dict = {}
         self.local_to_close_timeout = timedelta(seconds=10)
         self.retry_policy = RetryPolicy(
             initial_interval=timedelta(seconds=1),
@@ -358,6 +364,23 @@ class WealthManagementWorkflow:
         return investment_assistant
 
     def _make_open_account_assistant(self):
+        @tool
+        async def get_account_opening_status(workflow_id: str) -> str:
+            """Get the current status of an account opening.
+
+            Args:
+                workflow_id: The open-account child workflow ID returned by open_new_investment_account.
+
+            Returns:
+                The latest status the account opening reported. "Complete" means the account
+                was opened; a status starting with "Rolled back" means it was not opened.
+                Either way, that account opening is finished.
+            """
+            state = self._account_opening_states.get(workflow_id)
+            if state is None:
+                return f"No account opening with workflow ID {workflow_id} was found in this conversation."
+            return state
+
         @tool(context=True)
         async def open_account_assistant(client_id: str, request: str, tool_context: ToolContext) -> str:
             """Open a new investment account (a multi-step, durable KYC + compliance flow).
@@ -382,6 +405,7 @@ class WealthManagementWorkflow:
                 system_prompt=OPEN_ACCOUNT_INSTRUCTIONS,
                 tools=[
                     open_new_investment_account,
+                    get_account_opening_status,
                     _activity_tool(OpenAccount.get_current_client_info),
                     _activity_tool(OpenAccount.approve_kyc),
                     update_client_details,
@@ -395,6 +419,7 @@ class WealthManagementWorkflow:
     async def run(self, chat_input: ChatInput = ChatInput()) -> None:
         self.wf_id = workflow.info().workflow_id
         self.chat_history = list(chat_input.history)
+        self._account_opening_states = dict(chat_input.account_opening_states)
         if chat_input.open_account_messages:
             self._persistent_seed_messages["open_account"] = list(chat_input.open_account_messages)
 
@@ -452,6 +477,7 @@ class WealthManagementWorkflow:
                         open_account_messages=(
                             open_account_agent.messages if open_account_agent else []
                         ),
+                        account_opening_states=self._account_opening_states,
                     )
                 )
 
@@ -540,6 +566,7 @@ class WealthManagementWorkflow:
 
     @workflow.signal
     async def update_account_opening_state(self, state_input: UpdateAccountOpeningStateInput) -> None:
+        self._account_opening_states[state_input.workflow_id] = state_input.state
         # Surface a simple account-opening status. Compliance is approved out-of-band
         # by an employee via the run_send_compliance_approval CLI (using the child
         # workflow ID from the Temporal UI).
