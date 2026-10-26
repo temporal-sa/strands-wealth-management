@@ -1,8 +1,6 @@
 from dataclasses import dataclass
-from datetime import timedelta
 
 from temporalio import activity, workflow
-from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     from common.client_manager import ClientManager
@@ -20,12 +18,6 @@ class WealthManagementClient:
 
 
 class ClientActivities:
-    retry_policy = RetryPolicy(
-        initial_interval=timedelta(seconds=1),
-        backoff_coefficient=2,
-        maximum_interval=timedelta(seconds=30),
-    )
-
     @staticmethod
     @activity.defn
     async def get_client(client_id: str) -> "WealthManagementClient | None":

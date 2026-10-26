@@ -23,6 +23,11 @@ Scenarios currently implemented include:
 * **List Investments** — show accounts and their current balances
 * **Close Investment Account** — close an investment account
 
+The Temporal version also includes a **chaos panel** in the web UI for demonstrating
+failures Temporal handles: tool and LLM outages, LLM rate limits, non-retryable
+business-rule errors, a saga rollback, and a bug in workflow code. See
+[Failure scenarios](src/temporal_supervisor/README.md#failure-scenarios-chaos-panel).
+
 ## Architecture
 
 A **Supervisor** agent talks to the customer and routes each request to a specialist:
