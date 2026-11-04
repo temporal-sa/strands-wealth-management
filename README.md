@@ -95,6 +95,10 @@ The tests use a scripted model and stub activities, so they need no Gemini API k
 and no Redis. The workflow tests start a local Temporal test server, which is
 downloaded automatically on first run.
 
+A separate live test of the agent routing calls the paid Gemini API and is not part
+of that run: `source ./setgeminikey.sh && uv run pytest tests/live_agent_handoffs.py -s`
+(see [src/temporal_supervisor/README.md](src/temporal_supervisor/README.md#live-agent-routing-test-calls-the-paid-gemini-api)).
+
 ## Resetting the demo data
 
 Both versions read and write the JSON files in `data/` (beneficiaries, investment

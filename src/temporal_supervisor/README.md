@@ -316,6 +316,31 @@ failure scenarios (saga rollback, retries, the workflow bug), and the off-topic
 prompt. They use a scripted model and stub activities, so no Gemini key or Redis is
 needed; the Temporal test server is downloaded automatically on first run.
 
+### Live agent-routing test (calls the paid Gemini API)
+
+`tests/live_agent_handoffs.py` runs the real `WealthManagementWorkflow` against the
+real Gemini model, with the real beneficiary and investment activities (they only
+read `data/*.json`). Only the Redis-backed event stream activities are replaced with
+in-memory stand-ins, and the chaos flags are stubbed off, so no Redis is needed. The
+customer asks "Who are my beneficiaries?", gives client ID "123", then asks "What
+investments do I have?". The test checks that the beneficiaries (John, Jane, Joan)
+are listed, and that in the same turn the supervisor calls `investment_assistant`,
+the Investment Agent runs, and the reply lists Checking, Savings and 401K without
+mentioning a transfer or asking for the client ID again. It records every model
+call with the agent that made it, checks that no agent said anything about
+transferring the customer, and prints each run's transcript with that trace.
+
+It is not part of `uv run pytest` (pytest only collects `test_*.py`) because it
+calls the paid API, and it is skipped when `GEMINI_API_KEY` is not set. Run it from
+the project root with:
+
+```bash
+source ./setgeminikey.sh && uv run pytest tests/live_agent_handoffs.py -s
+```
+
+Model output varies, so `LIVE_TEST_RUNS=<n>` repeats the conversation n times
+(default 1), e.g. `LIVE_TEST_RUNS=10 uv run pytest tests/live_agent_handoffs.py -s`.
+
 ## Run on Temporal Cloud
 
 Redis still runs locally. From the project root:
