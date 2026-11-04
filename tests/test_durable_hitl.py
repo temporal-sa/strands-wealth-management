@@ -40,7 +40,7 @@ from strands.types.tools import ToolChoice, ToolSpec
 
 from common.user_message import ProcessUserMessageInput
 from temporal_supervisor.model_config import LLM_TASK_QUEUE
-from temporal_supervisor.workflows.supervisor_workflow import WealthManagementWorkflow, ChatInput
+from temporal_supervisor.workflows.supervisor_workflow import WealthManagementWorkflow
 
 TASK_QUEUE = "test-durable-hitl"
 CLIENT_ID = "C-1"
@@ -204,7 +204,6 @@ async def _run_scenario(env: WorkflowEnvironment, human_response: str) -> dict:
     ), Worker(client, task_queue=LLM_TASK_QUEUE):
         handle = await client.start_workflow(
             WealthManagementWorkflow.run,
-            ChatInput(),
             id=f"hitl-{human_response}-{uuid.uuid4()}",
             task_queue=TASK_QUEUE,
         )

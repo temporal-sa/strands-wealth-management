@@ -9,7 +9,12 @@ from dotenv import load_dotenv
 from temporalio.worker import Worker
 
 from temporal_supervisor.client_helper import connect_client
-from temporal_supervisor.model_config import LLM_MAX_CALLS_PER_SECOND, LLM_TASK_QUEUE, TASK_QUEUE
+from temporal_supervisor.model_config import (
+    LLM_MAX_CALLS_PER_SECOND,
+    LLM_TASK_QUEUE,
+    OPEN_ACCOUNT_TASK_QUEUE,
+    TASK_QUEUE,
+)
 from temporal_supervisor.activities.beneficiaries import Beneficiaries
 from temporal_supervisor.activities.investments import Investments
 from temporal_supervisor.activities.clients import ClientActivities
@@ -71,6 +76,8 @@ async def main():
     )
     limit = f"{LLM_MAX_CALLS_PER_SECOND}/s" if LLM_MAX_CALLS_PER_SECOND else "unlimited"
     print(f"Worker running on task queues '{TASK_QUEUE}' and '{LLM_TASK_QUEUE}' (model calls: {limit}). Ctrl+C to exit.")
+    if OPEN_ACCOUNT_TASK_QUEUE != TASK_QUEUE:
+        print(f"Open-account child workflows run on '{OPEN_ACCOUNT_TASK_QUEUE}'; start a worker that polls it.")
     await asyncio.gather(worker.run(), llm_worker.run())
 
 
