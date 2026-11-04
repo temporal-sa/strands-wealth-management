@@ -12,19 +12,29 @@ Scenarios currently implemented include:
 
 * Add Beneficiary, List Beneficiaries, Delete Beneficiary
 * Open Investment Account, List Investments, Close Investment Account
+* Questions that aren't about beneficiaries or investment accounts are politely
+  declined by the supervisor agent (handled in its prompt)
+
+Before deleting a beneficiary or closing an account, the agent asks for
+confirmation in the terminal (for example
+`Are you sure you want to delete beneficiary John Doe? (y/n):`); answer `y` to
+proceed. Opening an account is a single direct tool call (`open_investment`): no
+KYC, compliance approval, or saga, which only the Temporal version has.
 
 ## How it works
 
 * `tools.py` — the six `@tool` functions (backed by the file-based managers in `common/`).
 * `agents.py` — the Gemini model factory, the two specialist agents exposed as
   tools (`beneficiary_assistant`, `investment_assistant`), and `build_supervisor()`.
+* `approval.py` — `ConfirmDestructive`, the y/n confirmation before
+  `delete_beneficiary` / `close_investment`.
 * `main.py` — the interactive CLI loop.
 
 The supervisor collects the client ID once, then forwards it on every delegation.
 
 ## Prerequisites
 
-* [uv](https://docs.astral.sh/uv/)
+* [uv](https://docs.astral.sh/uv/) and Python 3.10 or later
 * A [Gemini API key](https://aistudio.google.com/api-keys)
 
 ## Set up the Python environment
@@ -87,4 +97,5 @@ Goodbye!
 ```
 
 You can also add/delete beneficiaries and open/close investment accounts.
-Try client ID `123` or `234`.
+Try client ID `123` or `234`. These changes are written to the JSON files in
+`data/`; restore them from the project root with `git checkout data/`.

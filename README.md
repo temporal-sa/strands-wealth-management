@@ -4,8 +4,7 @@ Demonstrates how to build a multi-agent wealth management assistant with
 [Strands Agents](https://strandsagents.com/) using a supervisor that delegates to
 specialized sub-agents (the Strands ["agents as tools"](https://strandsagents.com/latest/documentation/docs/user-guide/concepts/multi-agent/agents-as-tools/) pattern).
 
-It ships in two flavors, mirroring the
-[ADK Wealth Management demo](https://github.com/temporal-sa/adk-wealth-management):
+It ships in two flavors:
 
 - **Strands only** (command-line) — [`src/strands_supervisor`](src/strands_supervisor/README.md)
 - **Temporal + Strands** (durable execution, with a **React frontend + FastAPI backend**) —
@@ -22,6 +21,12 @@ Scenarios currently implemented include:
 * **Open Investment Account** — open a new investment account (using a **child workflow** in the Temporal version)
 * **List Investments** — show accounts and their current balances
 * **Close Investment Account** — close an investment account
+* **Off-topic questions** — questions that aren't about beneficiaries or investment accounts are politely declined by the supervisor agent (handled in the agents' prompts)
+
+Deleting a beneficiary and closing an account ask the customer to confirm first.
+In the Strands-only version, opening an account is a single direct tool call (no
+KYC, compliance approval, or saga); the Temporal version runs the full
+open-account flow in a child workflow.
 
 The Temporal version also includes a **chaos panel** in the web UI for demonstrating
 failures Temporal handles: tool and LLM outages, LLM rate limits, non-retryable
@@ -40,12 +45,13 @@ Investment Agent to a dedicated **Open Account Agent** that drives an
 compliance-approval signal before creating the account.
 
 In the **Strands-only** (CLI) version there is no separate Open Account Agent:
-opening (`*`) is a single synchronous tool inside the Investment Agent, so that
+opening is a single synchronous tool inside the Investment Agent, so that
 agent does list / open / close.
 
 ## Prerequisites
 
 * [uv](https://docs.astral.sh/uv/) — Python package and project manager
+* Python 3.10 or later (`requires-python` in `pyproject.toml`; uv can install it for you)
 * [Google / Gemini API key](https://aistudio.google.com/api-keys) — to access Gemini models
 * [Temporal CLI](https://docs.temporal.io/cli#install) — local Temporal service (Temporal version only)
 * [Redis](https://redis.io/downloads/) — stores conversation history and status updates (Temporal version only)
@@ -70,7 +76,32 @@ Edit `setgeminikey.sh` and paste in your key:
 export GEMINI_API_KEY="Your API Key Goes Here"
 ```
 
+The start scripts source `setgeminikey.sh` from the project root if it exists.
+
 ## Getting started
 
 * Strands-only CLI version → [src/strands_supervisor/README.md](src/strands_supervisor/README.md)
 * Temporal + Strands version → [src/temporal_supervisor/README.md](src/temporal_supervisor/README.md)
+
+## Running the tests
+
+From the project root:
+
+```bash
+uv run pytest
+```
+
+The tests use a scripted model and stub activities, so they need no Gemini API key
+and no Redis. The workflow tests start a local Temporal test server, which is
+downloaded automatically on first run.
+
+## Resetting the demo data
+
+Both versions read and write the JSON files in `data/` (beneficiaries, investment
+accounts, client details, and linked bank account balances), so adding or deleting
+beneficiaries and opening or closing accounts change them. To restore the original
+data:
+
+```bash
+git checkout data/
+```
