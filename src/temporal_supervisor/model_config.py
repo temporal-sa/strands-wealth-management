@@ -30,8 +30,10 @@ LLM_TASK_QUEUE = (
     or f"{TASK_QUEUE}-llm"
 )
 # Task queue the open-account child workflow runs on. Defaults to the main queue,
-# where run_worker.py registers OpenInvestmentAccountWorkflow; set it to hand the
-# child workflow to a separate worker.
+# where run_worker.py registers OpenInvestmentAccountWorkflow. The worker start
+# scripts set it from their optional argument to hand the child workflow to a
+# separate worker (e.g. the Java worker in java/); run_worker.py then doesn't
+# register the Python version.
 OPEN_ACCOUNT_TASK_QUEUE = os.getenv("TEMPORAL_TASK_QUEUE_OPEN_ACCOUNT") or TASK_QUEUE
 
 

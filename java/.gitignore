@@ -1,0 +1,25 @@
+# Gradle
+.gradle/
+build/
+# The wrapper jar is needed by ./gradlew, so keep it even though other jars are ignored
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# Compiled class files
+*.class
+
+# IDE specific files
+.idea/
+*.iml
+*.iws
+*.ipr
+.project
+.classpath
+.settings/
+.vscode/
+
+# Log files
+*.log
+
+# Operating System Files
+.DS_Store

@@ -32,6 +32,8 @@ updates as the open-account child workflow progresses.
 | **Conversation history in Redis** | `EventStreamActivities` persist chat + status events the UI polls |
 | **Retries, non-retryable errors, saga** | See [Failure scenarios](#failure-scenarios-chaos-panel) |
 | **Task queue rate limiting** | Model calls on their own task queue, optionally capped with `LLM_MAX_CALLS_PER_SECOND` (`run_worker.py`) |
+| **Polyglot child workflow** | Optional Java version of `OpenInvestmentAccountWorkflow` on its own task queue, calling the Python activities ([java/](../../java/README.md)) |
+| **Claim check (payload codec)** | Optional: payloads stored in Redis, only their IDs sent to Temporal, with a codec server for the UI (`claim_check/`, `codec_server/`) |
 
 The chat workflow keeps the whole conversation in one run; a production version
 would need Continue-as-New for long conversations (see the TODO in
@@ -72,7 +74,8 @@ workflow).
 * [Node.js](https://nodejs.org/) 18+ and npm (for the React frontend)
 * A [Gemini API key](https://aistudio.google.com/api-keys)
 * [Temporal CLI](https://docs.temporal.io/cli#install)
-* [Redis](https://redis.io/downloads/)
+* [Redis](https://redis.io/downloads/) (chat history, status updates, chaos flags, and the optional claim check)
+* [Java JDK 25](https://adoptium.net/) — optional, only for the [Java open-account workflow](#run-with-the-java-open-account-workflow-optional) (the Gradle wrapper is included)
 
 ## Setup
 
@@ -120,6 +123,9 @@ cd src/frontend
 npm install      # first time only
 npm start        # opens http://localhost:3000
 ```
+
+To run the open-account child workflow in Java instead, see
+[Run with the Java open-account workflow](#run-with-the-java-open-account-workflow-optional).
 
 Click **Start Chat**, then try client ID `123` or `234`. Questions that aren't
 about beneficiaries or investment accounts are politely declined by the supervisor
@@ -193,12 +199,111 @@ temporal workflow list --query "WorkflowType='OpenInvestmentAccountWorkflow' AND
 The signal waits until KYC has been approved, so send it after you have confirmed
 your details.
 
+### Testing the open-account workflow on its own
+
+`startlocalopenaccount.sh` exercises `OpenInvestmentAccountWorkflow` without the chat or the LLM
+(no Gemini key needed). It starts a Python worker in the background, runs
+`run_open_account_workflow.py`, and stops the worker when it finishes. The script runs three
+scenarios for client `123`, each starting the workflow directly:
+
+1. KYC approved (`verify_kyc`), then compliance approved.
+2. Client details read (`get_client_details`) and changed (`update_client_details`, which completes
+   KYC: client 123's last name becomes "Doenut"), then compliance approved.
+3. KYC approved, then the workflow waits in `Waiting Compliance Review` until you send the approval
+   yourself. The script prints the command, for example
+   `src/temporal_supervisor/localsendcomplianceapproval.sh testing-open-account-<run>-3`.
+
+Temporal must be running (Redis too, for the chaos flags the activities read). From the project root:
+
+```bash
+src/temporal_supervisor/startlocalopenaccount.sh
+```
+
+With a task queue name, the workflow runs on that queue, so you can run the same scenarios against
+the Java workflow (start `java/startlocalworker.sh <queue>` first):
+
+```bash
+src/temporal_supervisor/startlocalopenaccount.sh Open-Account-Java
+```
+
+Further arguments go to `run_open_account_workflow.py`: `--scenario N` (repeatable) runs only some
+scenarios, and `--amount X` sets the initial deposit, e.g. `--scenario 1 --amount 300000` to see the
+saga roll back (client 123's linked bank account has less than that). Each run uses new workflow IDs
+(`testing-open-account-<run>-<scenario>`). Like the demo, the scenarios change `data/*.json`.
+
 ### Resetting the demo data
 
 Opening and closing accounts and editing beneficiaries change the JSON files in
 `data/` (the saga also changes linked bank account balances in
 `data/funding_accounts.json`). Restore them from the project root with
 `git checkout data/`.
+
+## Run with the Java open-account workflow (optional)
+
+[`java/`](../../java/README.md) has a Java (Spring Boot) version of `OpenInvestmentAccountWorkflow`
+with the same states, updates, signals, saga and status updates as the Python version. It calls the
+Python activities by name on the Python worker's task queue. To use it, give both workers the same
+open-account task queue name. From the project root:
+
+```bash
+src/temporal_supervisor/startlocalworker.sh Open-Account-Java   # terminal 1
+java/startlocalworker.sh Open-Account-Java                      # terminal 2 (needs JDK 25)
+```
+
+The argument sets `TEMPORAL_TASK_QUEUE_OPEN_ACCOUNT`. The supervisor then starts the child workflow
+on that queue, and the Python worker doesn't register the Python version of the workflow (it still
+runs all the activities, including the ones the Java workflow calls). Without an argument everything
+runs in Python, as before. Start the API and frontend and approve compliance as usual. For Temporal
+Cloud, use `src/temporal_supervisor/startcloudworker.sh Open-Account-Java` and
+`java/startcloudworker.sh Open-Account-Java`; see [java/README.md](../../java/README.md).
+
+## Claim check (optional)
+
+The [claim check pattern](https://www.enterpriseintegrationpatterns.com/patterns/messaging/StoreInLibrary.html)
+replaces the data sent to Temporal (workflow and activity inputs and results, signals, updates, model
+calls) with an ID, and stores the data in Redis. A
+[custom payload codec](https://docs.temporal.io/develop/python/converters-and-encryption#custom-payload-codec)
+(`claim_check/claim_check_codec.py`) does the substitution, and `claim_check/claim_check_plugin.py`
+adds it to the StrandsPlugin's data converter. Every Temporal client (worker, API, CLI chat,
+compliance-approval and open-account scripts, and the open-account activities) is built by
+`connect_client` in `client_helper.py`, which adds the plugin only when `USE_CLAIM_CHECK=true`. The
+Java worker has the same codec, so the two can be mixed.
+
+From the project root:
+
+```bash
+cp setclaimcheck.example setclaimcheck.sh
+```
+
+It contains:
+
+```bash
+export USE_CLAIM_CHECK=true
+export REDIS_HOST=localhost
+export REDIS_PORT=6379
+```
+
+All the start scripts (worker, API, CLI chat, compliance approval, codec server, the open-account
+scenarios and the Java workers) source `setclaimcheck.sh` from the project root if it exists, and run
+without claim check if it doesn't. Turn it on for every component or none: a client without the
+codec can't read claim-checked payloads. Redis must be running; the same Redis holds the chat history
+and the stored payloads. Every payload costs a round trip to Redis, and Redis downtime stops the
+workflows, so a production deployment needs a highly available store.
+
+### Codec server
+
+With claim check on, the Temporal UI shows only the IDs. To see the real payloads, run the codec
+server (it reads the same `setclaimcheck.sh`):
+
+```bash
+src/temporal_supervisor/startcodecserver.sh     # http://127.0.0.1:8081
+```
+
+Open the Temporal UI at exactly http://localhost:8233 (not 127.0.0.1): the codec server only accepts
+requests (CORS) from http://localhost:8233 and https://cloud.temporal.io. Click the glasses icon in
+the upper right, choose "Use my browser setting and ignore Cluster-level setting", enter
+`http://127.0.0.1:8081` (no trailing spaces), turn off "Pass the user access token" and "Include
+cross-origin credentials", and click **Apply**. The event history now shows the decoded payloads.
 
 ## Failure scenarios (chaos panel)
 
@@ -252,6 +357,21 @@ After the demo, re-arm the bug:
 git checkout src/temporal_supervisor/workflows/open_account_workflow.py
 ```
 
+### With the Java open-account workflow
+
+All the scenarios work the same way with the [Java workflow](#run-with-the-java-open-account-workflow-optional):
+it calls the Python activities, which read the chaos flags. The bug in the workflow code is different
+in Java: `BONUS_RATES` in
+`java/src/main/java/io/temporal/demo/wealthmanagement/workflow/OpenInvestmentAccountWorkflowImpl.java`
+is keyed by `"WELCOME_BONUS"` (underscore), but the promo code is `"WELCOME-BONUS"` (hyphen), so
+`welcomeBonus` throws a `NullPointerException`. As in Python, it fails the workflow task, not the
+workflow, so it stays **Running**. The fix is the commented-out line above it; restart the Java worker
+after fixing it, and re-arm the bug afterwards with:
+
+```bash
+git checkout java/src/main/java/io/temporal/demo/wealthmanagement/workflow/OpenInvestmentAccountWorkflowImpl.java
+```
+
 ### Optional: CLI client
 
 A command-line client is included for quick testing without the frontend/API (the
@@ -298,8 +418,9 @@ All parameters are query parameters.
 | `TEMPORAL_TASK_QUEUE` | `wealth-management-strands` | Main task queue (workflows and tools). Set the same value for the worker, API, and CLI client |
 | `TEMPORAL_TASK_QUEUE_LLM` | `<TEMPORAL_TASK_QUEUE>-llm` | Task queue for model calls. The older name `TEMPORAL_LLM_TASK_QUEUE` is still accepted |
 | `LLM_MAX_CALLS_PER_SECOND` | unset (no limit) | Max model calls per second dispatched from the LLM queue, across all workers |
-| `TEMPORAL_TASK_QUEUE_OPEN_ACCOUNT` | `<TEMPORAL_TASK_QUEUE>` | Task queue the open-account child workflow is started on. If you change it, also run a worker on that queue, e.g. `TEMPORAL_TASK_QUEUE=<queue> src/temporal_supervisor/startlocalworker.sh` |
-| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | Redis for chat history, status updates, and chaos flags |
+| `TEMPORAL_TASK_QUEUE_OPEN_ACCOUNT` | `<TEMPORAL_TASK_QUEUE>` | Task queue the open-account child workflow is started on. Set it with the argument to `startlocalworker.sh` / `startcloudworker.sh` (and pass the same name to `java/startlocalworker.sh` / `java/startcloudworker.sh`). When it differs from `TEMPORAL_TASK_QUEUE`, the Python worker doesn't register `OpenInvestmentAccountWorkflow` |
+| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | Redis for chat history, status updates, chaos flags, and claim check payloads |
+| `USE_CLAIM_CHECK` | `false` | `true` turns on the claim check codec (`setclaimcheck.sh`); see [Claim check](#claim-check-optional) |
 
 The scripts pass the environment through, so you can prefix any of them, e.g.
 `LLM_MAX_CALLS_PER_SECOND=0.2 src/temporal_supervisor/startlocalworker.sh`.
@@ -313,9 +434,18 @@ uv run pytest
 ```
 
 The tests cover the durable approval gate across sub-agents, the KYC guard, the
-failure scenarios (saga rollback, retries, the workflow bug), and the off-topic
-prompt. They use a scripted model and stub activities, so no Gemini key or Redis is
+failure scenarios (saga rollback, retries, the workflow bug), the off-topic
+prompt, and the claim check codec, plugin and codec server and the open-account
+task-queue split (`tests/test_claim_check.py`). They use a scripted model, stub
+activities and an in-memory stand-in for Redis, so no Gemini key or Redis is
 needed; the Temporal test server is downloaded automatically on first run.
+
+The Java workflow has its own tests (JDK 25):
+
+```bash
+cd java
+./gradlew test
+```
 
 ### Live agent-routing test (calls the paid Gemini API)
 
@@ -348,13 +478,19 @@ Redis still runs locally. From the project root:
 
 ```bash
 cp src/temporal_supervisor/setcloudenv.example setcloudenv.sh   # edit with your namespace + mTLS cert paths
-# terminal 1 (worker):
-source ./setcloudenv.sh && source ./setgeminikey.sh && uv run python src/temporal_supervisor/run_worker.py
+# terminal 1 (worker; the script sources setcloudenv.sh, setgeminikey.sh and setclaimcheck.sh itself):
+src/temporal_supervisor/startcloudworker.sh
 # terminal 2 (API; the script sources setcloudenv.sh itself):
 src/api/startcloudapi.sh
 # terminal 3 (frontend):
 cd src/frontend && npm install && npm start
 ```
+
+Running the worker by hand still works:
+`source ./setcloudenv.sh && source ./setgeminikey.sh && uv run python src/temporal_supervisor/run_worker.py`.
+To use the Java open-account workflow, pass the same task queue name to
+`src/temporal_supervisor/startcloudworker.sh <queue>` and `java/startcloudworker.sh <queue>` (see
+[java/README.md](../../java/README.md#running-with-temporal-cloud)).
 
 `connect_client` (`client_helper.py`) reads `TEMPORAL_ADDRESS`,
 `TEMPORAL_NAMESPACE`, and the `TEMPORAL_TLS_CLIENT_CERT_PATH` /

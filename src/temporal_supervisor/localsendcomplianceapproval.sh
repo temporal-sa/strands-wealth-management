@@ -7,4 +7,5 @@ if [ -z "$1" ]; then
    exit 1
 fi
 cd "$(dirname "$0")/../.." || exit 1
+[ -f setclaimcheck.sh ] && source ./setclaimcheck.sh
 uv run python src/temporal_supervisor/run_send_compliance_approval.py --workflow-id "$1"

@@ -1,0 +1,18 @@
+# Configuration for Temporal Cloud (Spring profile "tc").
+# startcloudworker.sh sets the environment variables below from ../setcloudenv.sh.
+spring:
+  temporal:
+    namespace: ${TEMPORAL_NAMESPACE:temporal-cloud-namespace} # https://docs.temporal.io/cloud/#temporal-cloud-namespace-id
+    connection:
+      target: ${TEMPORAL_ADDRESS:namespace.account_id.tmprl.cloud:7233} # namespace.accountId.tmprl.cloud:7233
+      mtls:
+        # The key must be PKCS8 (-----BEGIN PRIVATE KEY-----); see startcloudworker.sh
+        key-file: ${TEMPORAL_KEY_PKCS8_PATH:/path/to/your.key}
+        cert-chain-file: ${TEMPORAL_CERT_PATH:/path/to/your/cert.pem}
+        insecure-trust-manager: false # or add ca.pem to java default truststore
+        # more configuration options https://github.com/temporalio/sdk-java/tree/master/temporal-spring-boot-autoconfigure#mtls
+  # Redis configuration (claim check storage, see ../setclaimcheck.example)
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}

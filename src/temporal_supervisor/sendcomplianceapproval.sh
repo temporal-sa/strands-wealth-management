@@ -12,4 +12,5 @@ if [ ! -f setcloudenv.sh ]; then
    exit 1
 fi
 source ./setcloudenv.sh
+[ -f setclaimcheck.sh ] && source ./setclaimcheck.sh
 uv run python src/temporal_supervisor/run_send_compliance_approval.py --workflow-id "$1"
