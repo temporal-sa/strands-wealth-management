@@ -22,8 +22,19 @@ MODEL_ID = "gemini-2.5-flash"
 
 TASK_QUEUE = os.getenv("TEMPORAL_TASK_QUEUE", "wealth-management-strands")
 # Model calls run on their own task queue so they can be rate limited (and scaled)
-# independently of the tools. See run_worker.py.
-LLM_TASK_QUEUE = os.getenv("TEMPORAL_LLM_TASK_QUEUE", f"{TASK_QUEUE}-llm")
+# independently of the tools. See run_worker.py. TEMPORAL_TASK_QUEUE_LLM matches the
+# other ports; TEMPORAL_LLM_TASK_QUEUE is still accepted for existing setups.
+LLM_TASK_QUEUE = (
+    os.getenv("TEMPORAL_TASK_QUEUE_LLM")
+    or os.getenv("TEMPORAL_LLM_TASK_QUEUE")
+    or f"{TASK_QUEUE}-llm"
+)
+# Task queue the open-account child workflow runs on. Defaults to the main queue,
+# where run_worker.py registers OpenInvestmentAccountWorkflow. The worker start
+# scripts set it from their optional argument to hand the child workflow to a
+# separate worker (e.g. the Java worker in java/); run_worker.py then doesn't
+# register the Python version.
+OPEN_ACCOUNT_TASK_QUEUE = os.getenv("TEMPORAL_TASK_QUEUE_OPEN_ACCOUNT") or TASK_QUEUE
 
 
 def _optional_float(name: str) -> Optional[float]:

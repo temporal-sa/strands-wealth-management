@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from common.user_message import ProcessUserMessageInput
 from temporal_supervisor.client_helper import connect_client
 from temporal_supervisor.model_config import TASK_QUEUE
-from temporal_supervisor.workflows.supervisor_workflow import WealthManagementWorkflow, ChatInput
+from temporal_supervisor.workflows.supervisor_workflow import WealthManagementWorkflow
 
 load_dotenv()
 logging.getLogger("temporalio").setLevel(logging.WARNING)
@@ -33,7 +33,6 @@ async def main():
     workflow_id = f"wealth-management-{uuid.uuid4()}"
     handle = await client.start_workflow(
         WealthManagementWorkflow.run,
-        ChatInput(),
         id=workflow_id,
         task_queue=TASK_QUEUE,
     )

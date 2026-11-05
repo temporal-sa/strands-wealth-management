@@ -9,7 +9,12 @@ from dotenv import load_dotenv
 from temporalio.worker import Worker
 
 from temporal_supervisor.client_helper import connect_client
-from temporal_supervisor.model_config import LLM_MAX_CALLS_PER_SECOND, LLM_TASK_QUEUE, TASK_QUEUE
+from temporal_supervisor.model_config import (
+    LLM_MAX_CALLS_PER_SECOND,
+    LLM_TASK_QUEUE,
+    OPEN_ACCOUNT_TASK_QUEUE,
+    TASK_QUEUE,
+)
 from temporal_supervisor.activities.beneficiaries import Beneficiaries
 from temporal_supervisor.activities.investments import Investments
 from temporal_supervisor.activities.clients import ClientActivities
@@ -24,6 +29,20 @@ from temporal_supervisor.workflows.open_account_workflow import OpenInvestmentAc
 load_dotenv()
 
 
+def choose_workflows(task_queue: str = TASK_QUEUE, open_account_task_queue: str = OPEN_ACCOUNT_TASK_QUEUE) -> list:
+    """The workflows this worker runs on the main task queue.
+
+    When the open-account child workflow has its own task queue (the first argument
+    to startlocalworker.sh / startcloudworker.sh, e.g. for the Java worker), this
+    worker leaves OpenInvestmentAccountWorkflow to the worker polling that queue.
+    It still registers every activity, so that workflow can call them by name on
+    the main task queue.
+    """
+    if open_account_task_queue == task_queue:
+        return [WealthManagementWorkflow, OpenInvestmentAccountWorkflow]
+    return [WealthManagementWorkflow]
+
+
 async def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -35,7 +54,7 @@ async def main():
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
-        workflows=[WealthManagementWorkflow, OpenInvestmentAccountWorkflow],
+        workflows=choose_workflows(),
         activities=[
             Beneficiaries.list_beneficiaries,
             Beneficiaries.add_beneficiary,
@@ -71,6 +90,11 @@ async def main():
     )
     limit = f"{LLM_MAX_CALLS_PER_SECOND}/s" if LLM_MAX_CALLS_PER_SECOND else "unlimited"
     print(f"Worker running on task queues '{TASK_QUEUE}' and '{LLM_TASK_QUEUE}' (model calls: {limit}). Ctrl+C to exit.")
+    if OPEN_ACCOUNT_TASK_QUEUE != TASK_QUEUE:
+        print(
+            f"Open-account child workflows run on '{OPEN_ACCOUNT_TASK_QUEUE}', not on this worker; "
+            "start the worker that polls it (e.g. java/startlocalworker.sh with the same queue name)."
+        )
     await asyncio.gather(worker.run(), llm_worker.run())
 
 

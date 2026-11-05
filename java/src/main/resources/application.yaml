@@ -1,0 +1,17 @@
+spring:
+  main:
+    allow-bean-definition-overriding: true
+    web-application-type: none
+  application:
+    name: open-account
+  # Temporal connection (defaults to the local dev server; TEMPORAL_ADDRESS / TEMPORAL_NAMESPACE
+  # override it, as for the Python components)
+  temporal:
+    namespace: ${TEMPORAL_NAMESPACE:default}
+    connection:
+      target: ${TEMPORAL_ADDRESS:127.0.0.1:7233}
+  # Redis for the claim check codec (only used when USE_CLAIM_CHECK=true, see ../setclaimcheck.example)
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}

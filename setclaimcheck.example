@@ -1,0 +1,5 @@
+# Copy to setclaimcheck.sh (in the project root) to turn on the claim-check codec.
+# The start scripts source it if it exists. Redis must be running.
+export USE_CLAIM_CHECK=true
+export REDIS_HOST=localhost
+export REDIS_PORT=6379

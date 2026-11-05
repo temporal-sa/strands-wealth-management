@@ -1,5 +1,4 @@
 import asyncio
-from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import List, Optional
 
@@ -26,7 +25,7 @@ with workflow.unsafe.imports_passed_through():
     from strands.types.tools import ToolContext
     from temporalio.contrib.strands import TemporalAgent
     from temporalio.contrib.strands.workflow import activity_as_tool
-    from temporal_supervisor.model_config import LLM_TASK_QUEUE, MODEL_NAME
+    from temporal_supervisor.model_config import LLM_TASK_QUEUE, MODEL_NAME, OPEN_ACCOUNT_TASK_QUEUE
     from temporal_supervisor.activities.beneficiaries import Beneficiaries
     from temporal_supervisor.activities.investments import Investments
     from temporal_supervisor.activities.open_account import OpenAccount
@@ -93,58 +92,22 @@ def _slugify(name: str) -> str:
     return slug.strip("-")[:40] or "account"
 
 
-@tool
-async def open_new_investment_account(client_id: str, account_name: str, initial_amount: float) -> str:
-    """Begin opening a new investment account via a durable child workflow.
+KYC_NOT_APPROVED = (
+    "KYC was not approved. First show the customer their current details for this account "
+    "opening (get_current_client_info) and ask whether they are correct. Approve KYC only "
+    "after the customer confirms in their next message."
+)
 
-    Args:
-        client_id: The customer's client ID.
-        account_name: The name for the new investment account.
-        initial_amount: The initial deposit amount.
 
-    Returns:
-        The child workflow ID, which the other open-account tools require, or
-        the reason the account cannot be opened.
+def kyc_confirmed(shown_turn: Optional[int], turn: int) -> bool:
+    """Whether an account opening's details were shown in an earlier customer turn.
+
+    The model sometimes treats a confirmation for an earlier account opening as
+    approval for a new one, or approves in the same turn it shows the details.
+    KYC may only be approved once this opening's details have been shown and the
+    customer has replied since.
     """
-    # Business rules are checked up front. A violation is a non-retryable error:
-    # it fails on the first attempt, and the reason goes back to the agent.
-    try:
-        await workflow.execute_activity(
-            Investments.validate_new_account,
-            args=[client_id, account_name, initial_amount],
-            start_to_close_timeout=ACTIVITY_TIMEOUT,
-            retry_policy=TOOL_RETRY_POLICY,
-        )
-    except ActivityError as e:
-        # Strands only shows the model str(error), which for an ActivityError is
-        # "Activity task failed"; pass the business reason through instead.
-        if isinstance(e.__cause__, ApplicationError):
-            return f"The account cannot be opened: {e.__cause__.message}"
-        raise
-
-    # Read in an activity so the result is recorded in history and replays the same.
-    promo_code = await workflow.execute_activity(
-        Investments.find_promotion,
-        client_id,
-        start_to_close_timeout=ACTIVITY_TIMEOUT,
-        retry_policy=TOOL_RETRY_POLICY,
-    )
-    account_input = OpenInvestmentAccountInput(
-        client_id=client_id,
-        account_name=account_name,
-        initial_amount=initial_amount,
-        promo_code=promo_code,
-    )
-    # Slugify the account name for the ID only; the account keeps its real name
-    # via account_input above.
-    child_workflow_id = f"open-account-{workflow.info().workflow_id}-{_slugify(account_name)}-{workflow.uuid4()}"
-    await workflow.start_child_workflow(
-        OpenInvestmentAccountWorkflow.run,
-        account_input,
-        id=child_workflow_id,
-        parent_close_policy=ParentClosePolicy.ABANDON,
-    )
-    return child_workflow_id
+    return shown_turn is not None and shown_turn < turn
 
 
 @tool
@@ -188,19 +151,6 @@ async def update_client_details(
     )
 
 
-@dataclass
-class ChatInput:
-    """Carried across continue-as-new so the conversation survives history resets."""
-    messages: list = field(default_factory=list)
-    history: List[ChatInteraction] = field(default_factory=list)
-    # The persistent open-account agent's own message history (see
-    # _make_open_account_assistant); carried so a multi-turn account-opening flow
-    # survives a continue-as-new mid-flight.
-    open_account_messages: list = field(default_factory=list)
-    # Latest state of each open-account child workflow, keyed by its workflow ID.
-    account_opening_states: dict = field(default_factory=dict)
-
-
 @workflow.defn
 class WealthManagementWorkflow:
     def __init__(self):
@@ -215,19 +165,26 @@ class WealthManagementWorkflow:
         self._agent: Optional[TemporalAgent] = None
         # Sub-agents persisted across an interrupt/resume, keyed by the supervisor
         # tool_use id that spawned them. See _run_subagent. Only ever holds an
-        # entry mid-turn (while an approval is pending); empty between turns, so it
-        # does not need to be carried across continue-as-new.
+        # entry mid-turn (while an approval is pending); empty between turns.
         self._subagents: dict = {}
         # Long-lived sub-agents that must own multi-turn state (the open-account
         # agent owns its child-workflow ID), keyed by a stable name rather than by
-        # tool_use id so the same agent is reused across supervisor turns. Their
-        # message history IS carried across continue-as-new; see run().
+        # tool_use id so the same agent is reused across supervisor turns.
         self._persistent_subagents: dict = {}
-        self._persistent_seed_messages: dict = {}
-        # Latest state reported by each open-account child workflow (see
-        # update_account_opening_state), so the open-account agent can check the
-        # real status instead of relying on what it remembers.
+        # Latest state and account name reported by each open-account child
+        # workflow (see update_account_opening_state), so the open-account agent
+        # gets the real status instead of relying on what it remembers.
         self._account_opening_states: dict = {}
+        self._account_opening_names: dict = {}
+        # Number of account openings started in this conversation, used in their
+        # child workflow IDs.
+        self._account_openings_started = 0
+        # Number of the customer message being processed, and the message in which
+        # each account opening's client details were shown, keyed by its workflow
+        # ID. Used to check that the customer confirmed their details before KYC is
+        # approved (see kyc_confirmed).
+        self._turn = 0
+        self._kyc_details_shown_turn: dict = {}
         self.local_to_close_timeout = timedelta(seconds=10)
         self.retry_policy = RetryPolicy(
             initial_interval=timedelta(seconds=1),
@@ -270,7 +227,6 @@ class WealthManagementWorkflow:
                 # message history (and the child-workflow ID it holds) carries over.
                 sub = self._persistent_subagents[persistent_key]
             else:
-                seed = self._persistent_seed_messages.pop(persistent_key, []) if persistent_key else []
                 sub = TemporalAgent(
                     model=MODEL_NAME,
                     task_queue=LLM_TASK_QUEUE,
@@ -279,7 +235,6 @@ class WealthManagementWorkflow:
                     system_prompt=system_prompt,
                     tools=tools,
                     hooks=[ApprovalHook()],
-                    messages=seed,
                 )
                 if persistent_key is not None:
                     self._persistent_subagents[persistent_key] = sub
@@ -365,6 +320,74 @@ class WealthManagementWorkflow:
 
     def _make_open_account_assistant(self):
         @tool
+        async def open_new_investment_account(client_id: str, account_name: str, initial_amount: float) -> str:
+            """Begin opening a new investment account via a durable child workflow.
+
+            Args:
+                client_id: The customer's client ID.
+                account_name: The name for the new investment account.
+                initial_amount: The initial deposit amount.
+
+            Returns:
+                The child workflow ID, which the other open-account tools require, or
+                the reason the account cannot be opened. Starting the opening does not
+                open the account: it still needs KYC and a compliance review.
+            """
+            # Business rules are checked up front. A violation is a non-retryable error:
+            # it fails on the first attempt, and the reason goes back to the agent.
+            try:
+                await workflow.execute_activity(
+                    Investments.validate_new_account,
+                    args=[client_id, account_name, initial_amount],
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=TOOL_RETRY_POLICY,
+                )
+            except ActivityError as e:
+                # Strands only shows the model str(error), which for an ActivityError is
+                # "Activity task failed"; pass the business reason through instead.
+                if isinstance(e.__cause__, ApplicationError):
+                    return f"The account cannot be opened: {e.__cause__.message}"
+                raise
+
+            # Read in an activity so the result is recorded in history and replays the same.
+            promo_code = await workflow.execute_activity(
+                Investments.find_promotion,
+                client_id,
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=TOOL_RETRY_POLICY,
+            )
+            account_input = OpenInvestmentAccountInput(
+                client_id=client_id,
+                account_name=account_name,
+                initial_amount=initial_amount,
+                promo_code=promo_code,
+            )
+            # Slugify the account name for the ID only; the account keeps its real name
+            # via account_input above. The number keeps the ID unique when the same
+            # account name is opened again in this conversation, and keeps it short
+            # enough to type into the compliance-approval script.
+            self._account_openings_started += 1
+            child_workflow_id = (
+                f"open-account-{workflow.info().workflow_id}-{_slugify(account_name)}"
+                f"-{self._account_openings_started}"
+            )
+            # TERMINATE matches the other ports: ending the conversation stops its pending
+            # account openings.
+            await workflow.start_child_workflow(
+                OpenInvestmentAccountWorkflow.run,
+                account_input,
+                id=child_workflow_id,
+                parent_close_policy=ParentClosePolicy.TERMINATE,
+                task_queue=OPEN_ACCOUNT_TASK_QUEUE,
+            )
+            # A bare ID reads like success, and the model told customers their account
+            # was open. Say plainly that it is not.
+            return (
+                f"Account opening started. The account is NOT open yet: the customer must confirm "
+                f"their details (KYC), then it needs a compliance review. Workflow ID: {child_workflow_id}"
+            )
+
+        @tool
         async def get_account_opening_status(workflow_id: str) -> str:
             """Get the current status of an account opening.
 
@@ -380,6 +403,39 @@ class WealthManagementWorkflow:
             if state is None:
                 return f"No account opening with workflow ID {workflow_id} was found in this conversation."
             return state
+
+        @tool
+        async def get_current_client_info(workflow_id: str) -> dict:
+            """Retrieve the customer's current details for an account opening, to show them for KYC.
+
+            Args:
+                workflow_id: The open-account child workflow ID returned by open_new_investment_account.
+            """
+            client = await workflow.execute_activity(
+                OpenAccount.get_current_client_info,
+                workflow_id,
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=TOOL_RETRY_POLICY,
+            )
+            self._kyc_details_shown_turn[workflow_id] = self._turn
+            return client
+
+        @tool
+        async def approve_kyc(workflow_id: str) -> str:
+            """Approve KYC for an account opening, after the customer confirmed their details are correct.
+
+            Args:
+                workflow_id: The open-account child workflow ID returned by open_new_investment_account.
+            """
+            if not kyc_confirmed(self._kyc_details_shown_turn.get(workflow_id), self._turn):
+                return KYC_NOT_APPROVED
+            await workflow.execute_activity(
+                OpenAccount.approve_kyc,
+                workflow_id,
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=TOOL_RETRY_POLICY,
+            )
+            return "KYC approved. The account is now waiting for compliance review."
 
         @tool(context=True)
         async def open_account_assistant(client_id: str, request: str, tool_context: ToolContext) -> str:
@@ -398,16 +454,19 @@ class WealthManagementWorkflow:
             Returns:
                 The open-account agent's response.
             """
+            # The agent is persistent, so its history holds whatever status it last
+            # saw. Give it the current status on every turn so a finished opening
+            # (for example, one that was rolled back) is never reported as pending.
             return await self._run_subagent(
                 tool_context=tool_context,
                 client_id=client_id,
-                request=request,
+                request=f"{self._account_openings_summary()}{request}",
                 system_prompt=OPEN_ACCOUNT_INSTRUCTIONS,
                 tools=[
                     open_new_investment_account,
                     get_account_opening_status,
-                    _activity_tool(OpenAccount.get_current_client_info),
-                    _activity_tool(OpenAccount.approve_kyc),
+                    get_current_client_info,
+                    approve_kyc,
                     update_client_details,
                 ],
                 persistent_key="open_account",
@@ -415,21 +474,27 @@ class WealthManagementWorkflow:
 
         return open_account_assistant
 
-    @workflow.run
-    async def run(self, chat_input: ChatInput = ChatInput()) -> None:
-        self.wf_id = workflow.info().workflow_id
-        self.chat_history = list(chat_input.history)
-        self._account_opening_states = dict(chat_input.account_opening_states)
-        if chat_input.open_account_messages:
-            self._persistent_seed_messages["open_account"] = list(chat_input.open_account_messages)
+    def _account_openings_summary(self) -> str:
+        """The current status of each account opening in this conversation, as a
+        sentence to put before the customer's request (empty when there are none)."""
+        if not self._account_opening_states:
+            return ""
+        openings = "; ".join(
+            f'{self._account_opening_names[workflow_id]} (workflow ID {workflow_id}): "{state}"'
+            for workflow_id, state in self._account_opening_states.items()
+        )
+        return f"Current status of account openings in this conversation: {openings}. "
 
-        if workflow.info().continued_run_id is None:
-            await workflow.execute_local_activity(
-                EventStreamActivities.delete_conversation,
-                args=[self.wf_id],
-                start_to_close_timeout=self.local_to_close_timeout,
-                retry_policy=self.retry_policy,
-            )
+    @workflow.run
+    async def run(self) -> None:
+        self.wf_id = workflow.info().workflow_id
+
+        await workflow.execute_local_activity(
+            EventStreamActivities.delete_conversation,
+            args=[self.wf_id],
+            start_to_close_timeout=self.local_to_close_timeout,
+            retry_policy=self.retry_policy,
+        )
 
         # The supervisor is a pure orchestrator: it delegates beneficiary and
         # investment requests to specialized sub-agents (see _make_*_assistant).
@@ -446,7 +511,6 @@ class WealthManagementWorkflow:
                 self._make_beneficiary_assistant(),
                 self._make_investment_assistant(),
             ],
-            messages=list(chat_input.messages),
         )
 
         while True:
@@ -467,21 +531,26 @@ class WealthManagementWorkflow:
             if not self.pending_chat_messages.empty():
                 await self._process_chat_message(self.pending_chat_messages.get_nowait())
 
-            if workflow.info().is_continue_as_new_suggested():
-                await workflow.wait_condition(workflow.all_handlers_finished)
-                open_account_agent = self._persistent_subagents.get("open_account")
-                workflow.continue_as_new(
-                    ChatInput(
-                        messages=self._agent.messages,
-                        history=self.chat_history,
-                        open_account_messages=(
-                            open_account_agent.messages if open_account_agent else []
-                        ),
-                        account_opening_states=self._account_opening_states,
-                    )
-                )
+            # TODO: Continue-As-New.
+            # This demo keeps the whole conversation in one workflow run. A production system
+            # would call continue-as-new when workflow.info().is_continue_as_new_suggested()
+            # returns true, because Temporal limits a run's event history (warnings at 10K
+            # events / 10 MB, terminated at 50K events / 50 MB) and every LLM call and tool
+            # call adds events, so a long-running chat would eventually hit those limits.
+            # To do it safely:
+            #   - Wait for workflow.all_handlers_finished() and drain the pending message and
+            #     status queues first, so no customer message or status update is lost.
+            #   - Carry the conversation state into the new run: the message history, the
+            #     active agent, the client ID, the account-opening states, names, and
+            #     count, and the KYC guard's turn tracking.
+            #   - Open-account child workflows are started with ParentClosePolicy.TERMINATE,
+            #     which also applies when the parent continues-as-new, so an opening waiting
+            #     for KYC or compliance would be terminated. Use ParentClosePolicy.ABANDON and
+            #     have the end_workflow handler cancel/terminate any openings still running,
+            #     or defer continue-as-new until no opening is in progress.
 
     async def _process_chat_message(self, message: str) -> None:
+        self._turn += 1
         chat = ChatInteraction(user_prompt=message, text_response="")
 
         result = await self._agent.invoke_async(message)
@@ -567,9 +636,10 @@ class WealthManagementWorkflow:
     @workflow.signal
     async def update_account_opening_state(self, state_input: UpdateAccountOpeningStateInput) -> None:
         self._account_opening_states[state_input.workflow_id] = state_input.state
+        self._account_opening_names[state_input.workflow_id] = state_input.account_name
         # Surface a simple account-opening status. Compliance is approved out-of-band
         # by an employee via the run_send_compliance_approval CLI (using the child
         # workflow ID from the Temporal UI).
         await self.pending_status_updates.put(
-            f"New '{state_input.account_name}' account status: {state_input.state}"
+            f"New {state_input.account_name} account status changed: {state_input.state}"
         )

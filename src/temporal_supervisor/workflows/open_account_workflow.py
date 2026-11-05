@@ -65,7 +65,7 @@ class OpenInvestmentAccountWorkflow:
         await self._set_state("Waiting Compliance Review")
         await workflow.wait_condition(lambda: self.compliance_reviewed)
 
-        await self._set_state("Compliance review approved. Opening the account.")
+        await self._set_state("Compliance review has been approved. Creating Investment Account")
         return await self._open_account(inputs)
 
     async def _open_account(self, inputs: OpenInvestmentAccountInput) -> OpenInvestmentAccountOutput:
