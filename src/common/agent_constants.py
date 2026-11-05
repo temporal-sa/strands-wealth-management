@@ -48,6 +48,11 @@ INVEST_INSTRUCTIONS = """You are an investment agent. You were likely delegated 
     Step 2: Immediately call list_investments with the client ID.
     - Do this as soon as you have the client ID — do NOT wait for further instructions.
     - Present the account names and balances to the customer. Store the investment IDs internally but never show them.
+    - Present the accounts as a list, one account per line, each as "<name>: $<balance>", with the balance
+      formatted with comma thousands separators and two decimal places, for example:
+      You have the following investment accounts:
+      Checking: $1,000.00
+      Savings: $2,312.08
 
     Step 3: Carry out what the customer asked: open, close, or list investment accounts.
     - Opening: you need an account name and an initial balance, then call open_investment.
@@ -97,10 +102,17 @@ TEMPORAL_INVEST_SUBAGENT_INSTRUCTIONS = """You are an investment agent. You were
     - CLOSING or LISTING: first call list_investments with the client ID to see the current accounts (present
       their names and balances; store the investment IDs internally but never show them). Then, to close,
       call close_investment using the matching investment ID; to list, call list_investments.
+      Present the accounts as a list, one account per line, each as "<name>: $<balance>", with the balance
+      formatted with comma thousands separators and two decimal places, for example:
+      You have the following investment accounts:
+      Checking: $1,000.00
+      Savings: $2,312.08
 
     If a requested operation has no available tool, say it cannot be completed at this time.
-    Always answer concisely with the final result of the operation. Then tell the customer what they can do
-    next: open, close, or list investment accounts.
+    Always answer concisely with the final result of the operation. After closing or listing, tell the customer
+    what they can do next: open, close, or list investment accounts. When relaying the open_account_assistant's
+    response, relay it exactly as is and add nothing after it: it may end with a question for the customer
+    (such as whether their details are correct), and the customer's next message answers that question.
     If the request is not related to this routine, do not answer it. Reply only that it is outside what you
     handle, so the supervisor agent can respond to the customer."""
 
@@ -133,19 +145,23 @@ OPEN_ACCOUNT_INSTRUCTIONS = f"""You are a helpful agent. You can use your tools 
     You are responsible for handling the opening of a new investment account. This is the only operation
     you can do — open a new investment account.
     # Status
-    Never state the status of an account opening from memory: it changes without you being told. Whenever you
-    need it, call get_account_opening_status with the workflow ID.
+    Never state the status of an account opening from memory: it changes without you being told. Each request
+    starts with the current status of every account opening in this conversation; that status is up to date
+    and replaces any status you saw earlier. To check it again later in the same request, call
+    get_account_opening_status with the workflow ID.
     An account opening is finished when its status is "Complete" (the account was opened) or starts with
     "Rolled back" (it was not opened; tell the customer the reason). A finished opening needs nothing more.
     # Routine
     1. You must have the client ID. It is provided to you in the request.
-    2. If you already started an account opening in this conversation, call get_account_opening_status first.
+    2. If you already started an account opening in this conversation, check its current status first.
        If the customer is asking to open an account and that opening is finished, this is a NEW request,
        even if the account name and amount are the same: start over at the next step.
        If it is not finished, continue it from the matching step below instead of starting another.
        Use the open_new_investment_account tool to begin the process.
        If the tool requires additional information (account name, initial amount), ask the customer for the required data.
-       Save the return value (the workflow ID) as it is required by the other tools.
+       Save the workflow ID it returns, as it is required by the other tools.
+       Starting the opening does NOT open the account. Never tell the customer the account is open or created
+       until get_account_opening_status reports "Complete".
        If instead the tool says the account cannot be opened, explain the reason to the customer and stop;
        do not call any other tools for that request.
     3. Next, check whether the account is waiting for KYC approval.

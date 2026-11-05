@@ -151,6 +151,13 @@ async def temporal_env():
         yield env
 
 
+def listed_on_own_line(account: str, reply: str) -> bool:
+    """Whether the account is on a line of its own, as "<name>: $<balance>", with the
+    balance formatted like $11,070.89."""
+    balance = r"\$\d{1,3}(?:,\d{3})*\.\d{2}"
+    return re.search(rf"^\W*{re.escape(account)}\W*: {balance}\s*$", reply, re.M) is not None
+
+
 def _trace(calls: list) -> str:
     lines = []
     for c in calls:
@@ -205,6 +212,8 @@ async def _run_conversation(env: WorkflowEnvironment, run: int) -> dict:
         for account in CLIENT_123_ACCOUNTS:
             if account not in reply:
                 failures.append(f"account {account} not listed")
+            elif not listed_on_own_line(account, reply):
+                failures.append(f"account {account} is not on its own line")
         if re.search(r"transfer", reply, re.I):
             failures.append("the reply talked about a transfer")
             chatter = True

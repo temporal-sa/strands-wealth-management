@@ -92,63 +92,6 @@ def _slugify(name: str) -> str:
     return slug.strip("-")[:40] or "account"
 
 
-@tool
-async def open_new_investment_account(client_id: str, account_name: str, initial_amount: float) -> str:
-    """Begin opening a new investment account via a durable child workflow.
-
-    Args:
-        client_id: The customer's client ID.
-        account_name: The name for the new investment account.
-        initial_amount: The initial deposit amount.
-
-    Returns:
-        The child workflow ID, which the other open-account tools require, or
-        the reason the account cannot be opened.
-    """
-    # Business rules are checked up front. A violation is a non-retryable error:
-    # it fails on the first attempt, and the reason goes back to the agent.
-    try:
-        await workflow.execute_activity(
-            Investments.validate_new_account,
-            args=[client_id, account_name, initial_amount],
-            start_to_close_timeout=ACTIVITY_TIMEOUT,
-            retry_policy=TOOL_RETRY_POLICY,
-        )
-    except ActivityError as e:
-        # Strands only shows the model str(error), which for an ActivityError is
-        # "Activity task failed"; pass the business reason through instead.
-        if isinstance(e.__cause__, ApplicationError):
-            return f"The account cannot be opened: {e.__cause__.message}"
-        raise
-
-    # Read in an activity so the result is recorded in history and replays the same.
-    promo_code = await workflow.execute_activity(
-        Investments.find_promotion,
-        client_id,
-        start_to_close_timeout=ACTIVITY_TIMEOUT,
-        retry_policy=TOOL_RETRY_POLICY,
-    )
-    account_input = OpenInvestmentAccountInput(
-        client_id=client_id,
-        account_name=account_name,
-        initial_amount=initial_amount,
-        promo_code=promo_code,
-    )
-    # Slugify the account name for the ID only; the account keeps its real name
-    # via account_input above.
-    child_workflow_id = f"open-account-{workflow.info().workflow_id}-{_slugify(account_name)}-{workflow.uuid4()}"
-    # TERMINATE matches the other ports: ending the conversation stops its pending
-    # account openings.
-    await workflow.start_child_workflow(
-        OpenInvestmentAccountWorkflow.run,
-        account_input,
-        id=child_workflow_id,
-        parent_close_policy=ParentClosePolicy.TERMINATE,
-        task_queue=OPEN_ACCOUNT_TASK_QUEUE,
-    )
-    return child_workflow_id
-
-
 KYC_NOT_APPROVED = (
     "KYC was not approved. First show the customer their current details for this account "
     "opening (get_current_client_info) and ask whether they are correct. Approve KYC only "
@@ -228,10 +171,14 @@ class WealthManagementWorkflow:
         # agent owns its child-workflow ID), keyed by a stable name rather than by
         # tool_use id so the same agent is reused across supervisor turns.
         self._persistent_subagents: dict = {}
-        # Latest state reported by each open-account child workflow (see
-        # update_account_opening_state), so the open-account agent can check the
-        # real status instead of relying on what it remembers.
+        # Latest state and account name reported by each open-account child
+        # workflow (see update_account_opening_state), so the open-account agent
+        # gets the real status instead of relying on what it remembers.
         self._account_opening_states: dict = {}
+        self._account_opening_names: dict = {}
+        # Number of account openings started in this conversation, used in their
+        # child workflow IDs.
+        self._account_openings_started = 0
         # Number of the customer message being processed, and the message in which
         # each account opening's client details were shown, keyed by its workflow
         # ID. Used to check that the customer confirmed their details before KYC is
@@ -373,6 +320,74 @@ class WealthManagementWorkflow:
 
     def _make_open_account_assistant(self):
         @tool
+        async def open_new_investment_account(client_id: str, account_name: str, initial_amount: float) -> str:
+            """Begin opening a new investment account via a durable child workflow.
+
+            Args:
+                client_id: The customer's client ID.
+                account_name: The name for the new investment account.
+                initial_amount: The initial deposit amount.
+
+            Returns:
+                The child workflow ID, which the other open-account tools require, or
+                the reason the account cannot be opened. Starting the opening does not
+                open the account: it still needs KYC and a compliance review.
+            """
+            # Business rules are checked up front. A violation is a non-retryable error:
+            # it fails on the first attempt, and the reason goes back to the agent.
+            try:
+                await workflow.execute_activity(
+                    Investments.validate_new_account,
+                    args=[client_id, account_name, initial_amount],
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=TOOL_RETRY_POLICY,
+                )
+            except ActivityError as e:
+                # Strands only shows the model str(error), which for an ActivityError is
+                # "Activity task failed"; pass the business reason through instead.
+                if isinstance(e.__cause__, ApplicationError):
+                    return f"The account cannot be opened: {e.__cause__.message}"
+                raise
+
+            # Read in an activity so the result is recorded in history and replays the same.
+            promo_code = await workflow.execute_activity(
+                Investments.find_promotion,
+                client_id,
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=TOOL_RETRY_POLICY,
+            )
+            account_input = OpenInvestmentAccountInput(
+                client_id=client_id,
+                account_name=account_name,
+                initial_amount=initial_amount,
+                promo_code=promo_code,
+            )
+            # Slugify the account name for the ID only; the account keeps its real name
+            # via account_input above. The number keeps the ID unique when the same
+            # account name is opened again in this conversation, and keeps it short
+            # enough to type into the compliance-approval script.
+            self._account_openings_started += 1
+            child_workflow_id = (
+                f"open-account-{workflow.info().workflow_id}-{_slugify(account_name)}"
+                f"-{self._account_openings_started}"
+            )
+            # TERMINATE matches the other ports: ending the conversation stops its pending
+            # account openings.
+            await workflow.start_child_workflow(
+                OpenInvestmentAccountWorkflow.run,
+                account_input,
+                id=child_workflow_id,
+                parent_close_policy=ParentClosePolicy.TERMINATE,
+                task_queue=OPEN_ACCOUNT_TASK_QUEUE,
+            )
+            # A bare ID reads like success, and the model told customers their account
+            # was open. Say plainly that it is not.
+            return (
+                f"Account opening started. The account is NOT open yet: the customer must confirm "
+                f"their details (KYC), then it needs a compliance review. Workflow ID: {child_workflow_id}"
+            )
+
+        @tool
         async def get_account_opening_status(workflow_id: str) -> str:
             """Get the current status of an account opening.
 
@@ -439,10 +454,13 @@ class WealthManagementWorkflow:
             Returns:
                 The open-account agent's response.
             """
+            # The agent is persistent, so its history holds whatever status it last
+            # saw. Give it the current status on every turn so a finished opening
+            # (for example, one that was rolled back) is never reported as pending.
             return await self._run_subagent(
                 tool_context=tool_context,
                 client_id=client_id,
-                request=request,
+                request=f"{self._account_openings_summary()}{request}",
                 system_prompt=OPEN_ACCOUNT_INSTRUCTIONS,
                 tools=[
                     open_new_investment_account,
@@ -455,6 +473,17 @@ class WealthManagementWorkflow:
             )
 
         return open_account_assistant
+
+    def _account_openings_summary(self) -> str:
+        """The current status of each account opening in this conversation, as a
+        sentence to put before the customer's request (empty when there are none)."""
+        if not self._account_opening_states:
+            return ""
+        openings = "; ".join(
+            f'{self._account_opening_names[workflow_id]} (workflow ID {workflow_id}): "{state}"'
+            for workflow_id, state in self._account_opening_states.items()
+        )
+        return f"Current status of account openings in this conversation: {openings}. "
 
     @workflow.run
     async def run(self) -> None:
@@ -512,8 +541,8 @@ class WealthManagementWorkflow:
             #   - Wait for workflow.all_handlers_finished() and drain the pending message and
             #     status queues first, so no customer message or status update is lost.
             #   - Carry the conversation state into the new run: the message history, the
-            #     active agent, the client ID, the account-opening states, and the KYC
-            #     guard's turn tracking.
+            #     active agent, the client ID, the account-opening states, names, and
+            #     count, and the KYC guard's turn tracking.
             #   - Open-account child workflows are started with ParentClosePolicy.TERMINATE,
             #     which also applies when the parent continues-as-new, so an opening waiting
             #     for KYC or compliance would be terminated. Use ParentClosePolicy.ABANDON and
@@ -607,6 +636,7 @@ class WealthManagementWorkflow:
     @workflow.signal
     async def update_account_opening_state(self, state_input: UpdateAccountOpeningStateInput) -> None:
         self._account_opening_states[state_input.workflow_id] = state_input.state
+        self._account_opening_names[state_input.workflow_id] = state_input.account_name
         # Surface a simple account-opening status. Compliance is approved out-of-band
         # by an employee via the run_send_compliance_approval CLI (using the child
         # workflow ID from the Temporal UI).

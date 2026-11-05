@@ -178,8 +178,9 @@ src/temporal_supervisor/sendcomplianceapproval.sh <child-workflow-id>
 ```
 
 The status text does not include the child workflow ID. Its format is
-`open-account-<chat workflow ID>-<account-name-slug>-<uuid>`, for example
-`open-account-strands-temporal-agent-k3j9x2m1q-retirement-<uuid>`. To find it, open
+`open-account-<chat workflow ID>-<account-name-slug>-<n>`, where `<n>` counts the
+account openings in the chat, for example
+`open-account-strands-temporal-agent-k3j9x2m1q-retirement-1`. To find it, open
 the [Temporal UI](http://localhost:8233), look for the **Running**
 `OpenInvestmentAccountWorkflow` (a child of your chat workflow, whose ID starts
 with `strands-temporal-agent-`) and copy its Workflow ID. You can also list them
