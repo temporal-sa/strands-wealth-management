@@ -4,7 +4,7 @@ from typing import List, Optional
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError, ApplicationError, WorkflowAlreadyStartedError
+from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.workflow import ParentClosePolicy
 
 from common.user_message import ProcessUserMessageInput, ChatInteraction
@@ -161,6 +161,10 @@ class WealthManagementWorkflow:
         # gets the real status instead of relying on what it remembers.
         self._account_opening_states: dict = {}
         self._account_opening_names: dict = {}
+        # Number of account openings started in this conversation. Each opening's
+        # child workflow ID ends with its number, so every request to open an
+        # account starts a new child workflow, even for the same account name.
+        self._account_openings_started = 0
         # Number of the customer message being processed, and the message in which
         # each account opening's client details were shown, keyed by its workflow
         # ID. Used to check that the customer confirmed their details before KYC is
@@ -344,44 +348,30 @@ class WealthManagementWorkflow:
                 initial_amount=initial_amount,
                 promo_code=promo_code,
             )
-            # Same format as the other ports. The ID is reused when the customer opens
-            # an account with the same name again (e.g. after a rollback); the child
-            # puts its run ID in the transfer IDs so the new opening moves money again.
+            # Same format as the other ports. The number counts the account openings
+            # started in this conversation (this one included), so every request to open
+            # an account starts a new child workflow with its own KYC, even when an
+            # opening with the same name is still running or has finished. It is kept in
+            # workflow state, so it replays the same, and counts only openings that
+            # were started (not ones refused above).
+            opening_number = self._account_openings_started + 1
             child_workflow_id = (
-                f"OpenAccount-{workflow.info().workflow_id}-{client_id}-{account_name}"
-            )
-            # Forget what the previous opening with this ID reported, so a reopened
-            # account is not shown as rolled back or KYC-confirmed. Put it back if
-            # that opening is still running.
-            previous = (
-                self._account_opening_states.pop(child_workflow_id, None),
-                self._account_opening_names.pop(child_workflow_id, None),
-                self._kyc_details_shown_turn.pop(child_workflow_id, None),
+                f"OpenAccount-{workflow.info().workflow_id}-{client_id}-{account_name}-{opening_number}"
             )
             # TERMINATE matches the other ports: ending the conversation stops its pending
             # account openings.
-            try:
-                await workflow.start_child_workflow(
-                    OpenInvestmentAccountWorkflow.run,
-                    account_input,
-                    id=child_workflow_id,
-                    parent_close_policy=ParentClosePolicy.TERMINATE,
-                    task_queue=OPEN_ACCOUNT_TASK_QUEUE,
-                )
-            except WorkflowAlreadyStartedError:
-                # Like the reference, starting a second opening with the same name
-                # fails while the first is running, and the error goes back to the agent.
-                for store, value in zip(
-                    (self._account_opening_states, self._account_opening_names, self._kyc_details_shown_turn),
-                    previous,
-                ):
-                    if value is not None:
-                        store.setdefault(child_workflow_id, value)
-                return (
-                    f"The account cannot be opened: an opening of an account named {account_name!r} "
-                    f"is already in progress (workflow ID {child_workflow_id}). Continue that one, "
-                    f"or choose a different account name."
-                )
+            await workflow.start_child_workflow(
+                OpenInvestmentAccountWorkflow.run,
+                account_input,
+                id=child_workflow_id,
+                parent_close_policy=ParentClosePolicy.TERMINATE,
+                task_queue=OPEN_ACCOUNT_TASK_QUEUE,
+            )
+            self._account_openings_started = opening_number
+            # Known from the start, so a status check right away doesn't report "not found"
+            # before the child's first state update arrives.
+            self._account_opening_states.setdefault(child_workflow_id, "Initializing")
+            self._account_opening_names.setdefault(child_workflow_id, account_name)
             # A bare ID reads like success, and the model told customers their account
             # was open. Say plainly that it is not.
             return (

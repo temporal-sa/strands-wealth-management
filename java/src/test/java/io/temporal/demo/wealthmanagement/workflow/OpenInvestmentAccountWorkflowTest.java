@@ -275,11 +275,12 @@ class OpenInvestmentAccountWorkflowTest {
     }
 
     @Test
-    void reopeningWithTheSameWorkflowIdUsesANewTransferId() {
-        // The supervisor reuses the workflow ID (OpenAccount-<chat>-<client>-<account name>) when the
-        // same account name is opened again, so the transfer ID includes the run ID: opening the
-        // account again after a rollback is a new transfer, not a repeat of the refunded one.
-        String workflowId = "OpenAccount-chat-1-" + CLIENT_ID + "-Vacation";
+    void restartingAWorkflowIdUsesANewTransferId() {
+        // The supervisor gives every account opening its own workflow ID
+        // (OpenAccount-<chat>-<client>-<account name>-<n>). The transfer ID also includes the run
+        // ID, so even if a workflow ID were started again after a rollback, it would be a new
+        // transfer, not a repeat of the refunded one.
+        String workflowId = "OpenAccount-chat-1-" + CLIENT_ID + "-Vacation-1";
         FAILURES.put("register_account", "reject");
         assertFalse(openAccount(workflowId).isAccount_created());
         String firstRun = runId(workflowId);
@@ -315,7 +316,7 @@ class OpenInvestmentAccountWorkflowTest {
 
     @Test
     void everyStateIsSignalledToTheParent() throws InterruptedException {
-        String childId = "OpenAccount-parent-test-" + CLIENT_ID + "-Test";
+        String childId = "OpenAccount-parent-test-" + CLIENT_ID + "-Test-1";
         TestParentWorkflow parent = client.newWorkflowStub(TestParentWorkflow.class,
                 WorkflowOptions.newBuilder().setWorkflowId("parent-test").setTaskQueue(OPEN_ACCOUNT_QUEUE).build());
         WorkflowClient.start(parent::run, input(null), childId);

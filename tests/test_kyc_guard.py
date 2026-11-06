@@ -22,6 +22,7 @@ from strands.models import Model
 from strands.types.content import Messages
 from strands.types.streaming import StreamEvent
 from temporalio import activity, workflow
+from temporalio.exceptions import ApplicationError
 from temporalio.contrib.strands import StrandsPlugin
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
@@ -35,8 +36,8 @@ from temporal_supervisor.workflows.supervisor_workflow import (
 
 TASK_QUEUE = "test-kyc-guard"
 CLIENT_ID = "123"
-CAR = "OpenAccount-test-123-Car"
-VACATION = "OpenAccount-test-123-Vacation"
+CAR = "OpenAccount-test-123-Car-1"
+VACATION = "OpenAccount-test-123-Vacation-2"
 
 # Account openings that KYC was approved for, in order, recorded worker-side.
 APPROVED: list = []
@@ -166,7 +167,8 @@ async def stub_delete_conversation(workflow_id: str) -> bool:
 
 @activity.defn(name="validate_new_account")
 async def stub_validate_new_account(client_id: str, account_name: str, initial_amount: float) -> None:
-    return None
+    if initial_amount > 1_000_000:
+        raise ApplicationError("The initial deposit exceeds the limit.", non_retryable=True)
 
 
 @activity.defn(name="find_promotion")
@@ -275,21 +277,29 @@ async def test_kyc_approved_only_after_the_customer_replies(temporal_env):
         await handle.signal(WealthManagementWorkflow.end_workflow)
 
 
-async def test_reopening_an_account_reuses_its_workflow_id(temporal_env):
-    # The child workflow ID is OpenAccount-<chat ID>-<client ID>-<account name>, as in
-    # the other ports. Opening the same name again fails while the first opening is
-    # running, and starts a new run with the same ID once it has finished, without
-    # carrying over the earlier KYC confirmation.
+async def test_every_request_to_open_an_account_starts_a_new_opening(temporal_env):
+    # The child workflow ID is OpenAccount-<chat ID>-<client ID>-<account name>-<n>,
+    # where n counts the openings started in this conversation. Opening Vacation again
+    # while the first opening is still running starts a second child workflow, and
+    # that opening needs its own KYC confirmation. A request refused by validation
+    # starts nothing and does not use up a number.
     APPROVED.clear()
     chat_id = f"kyc-guard-test-{uuid.uuid4()}"
-    car = f"OpenAccount-{chat_id}-{CLIENT_ID}-Car"
-    open_car = tool("open_new_investment_account", client_id=CLIENT_ID, account_name="Car", initial_amount=5000.0)
+    vacation_1 = f"OpenAccount-{chat_id}-{CLIENT_ID}-Vacation-1"
+    vacation_2 = f"OpenAccount-{chat_id}-{CLIENT_ID}-Vacation-2"
+
+    def open_vacation(amount: float = 13000.0) -> tuple:
+        return tool("open_new_investment_account", client_id=CLIENT_ID, account_name="Vacation",
+                    initial_amount=amount)
+
     SCRIPT[:] = [
-        *delegate(), open_car, *relay(),  # opens Car
-        *delegate(), open_car, *relay(),  # opens Car again while the first is running
-        *delegate(), tool("get_current_client_info", workflow_id=car), *relay(),  # shows the details
-        *delegate(), open_car, *relay(),  # reopens Car after the first finished
-        *delegate(), tool("approve_kyc", workflow_id=car), *relay(),  # approves with no new details shown
+        *delegate(), open_vacation(), tool("get_current_client_info", workflow_id=vacation_1), *relay(),
+        *delegate(), tool("approve_kyc", workflow_id=vacation_1), *relay(),  # confirms
+        *delegate(), open_vacation(2_000_000.0), *relay(),  # refused by validation
+        *delegate(), open_vacation(), *relay(),  # opens Vacation again
+        *delegate(), tool("approve_kyc", workflow_id=vacation_2), *relay(),  # no details shown for it
+        *delegate(), tool("get_current_client_info", workflow_id=vacation_2), *relay(),
+        *delegate(), tool("approve_kyc", workflow_id=vacation_2), *relay(),  # confirms
     ]
 
     worker, llm_worker = _workers(temporal_env)
@@ -304,25 +314,38 @@ async def test_reopening_an_account_reuses_its_workflow_id(temporal_env):
             WealthManagementWorkflow.run, id=chat_id, task_queue=TASK_QUEUE,
         )
 
-        reply = await _send(handle, "Open an account called Car with $5,000.")
-        assert f"Workflow ID: {car}" in reply
-        first_run = (await temporal_env.client.get_workflow_handle(car).describe()).run_id
+        await _send(handle, "Open Vacation with $13,000")
+        reply = await _send(handle, "Yes")
+        assert "KYC approved" in reply
+        assert APPROVED == [vacation_1]
 
-        reply = await _send(handle, "Open Car with $5,000.")
-        assert "already in progress" in reply and car in reply
+        reply = await _send(handle, "Open Vacation with $2,000,000")
+        assert "cannot be opened" in reply
+
+        reply = await _send(handle, "Open Vacation with $13,000")
+        assert f"Workflow ID: {vacation_2}" in reply
+
+        # Two separate child workflows, both running.
+        for child_id in (vacation_1, vacation_2):
+            description = await temporal_env.client.get_workflow_handle(child_id).describe()
+            assert description.status.name == "RUNNING"
+            assert description.parent_id == chat_id
+
+        # The first opening's confirmation does not approve KYC for the second.
+        reply = await _send(handle, "Yes")
+        assert "KYC was not approved" in reply
+        assert APPROVED == [vacation_1]
 
         await _send(handle, "Show my details.")
-        child = temporal_env.client.get_workflow_handle(car, run_id=first_run)
-        await child.signal("finish")
-        await child.result()
-
-        reply = await _send(handle, "Open Car with $5,000 again.")
-        assert f"Workflow ID: {car}" in reply
-        assert (await temporal_env.client.get_workflow_handle(car).describe()).run_id != first_run
-
         reply = await _send(handle, "Yes, that's correct.")
-        assert "KYC was not approved" in reply
-        assert APPROVED == []
+        assert "KYC approved" in reply
+        assert APPROVED == [vacation_1, vacation_2]
+
+        # Both openings run to completion independently.
+        for child_id in (vacation_1, vacation_2):
+            child = temporal_env.client.get_workflow_handle(child_id)
+            await child.signal("finish")
+            await child.result()
 
         assert SCRIPT == []
         await handle.signal(WealthManagementWorkflow.end_workflow)

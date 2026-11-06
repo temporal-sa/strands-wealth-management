@@ -185,10 +185,11 @@ async def test_transient_failures_are_retried_not_rolled_back(temporal_env):
     ]
 
 
-async def test_reopening_with_the_same_workflow_id_uses_a_new_transfer_id(temporal_env):
-    # The open-account tool reuses the workflow ID for the same account name, so a
-    # retry after a rollback must not look like a repeat of the earlier transfer.
-    workflow_id = f"open-account-test-{uuid.uuid4()}"
+async def test_restarting_a_workflow_id_uses_a_new_transfer_id(temporal_env):
+    # Every account opening gets its own workflow ID (OpenAccount-...-<n>). The transfer
+    # ID also includes the run ID, so even a workflow ID started again after a rollback
+    # would not look like a repeat of the earlier transfer.
+    workflow_id = f"OpenAccount-test-{uuid.uuid4()}-123-Vacation-1"
     TRANSFER_IDS.clear()
     async with _worker(temporal_env):
         for failures in ({"register_account": "reject"}, {}):

@@ -77,9 +77,9 @@ class OpenInvestmentAccountWorkflow:
         """
         amount = inputs.initial_amount
         bonus = self._welcome_bonus(inputs) if inputs.promo_code else 0.0
-        # Idempotency key: stable across activity retries and worker restarts. It
-        # includes the run ID because the workflow ID is reused when the customer
-        # opens an account with the same name again (e.g. after a rollback).
+        # Idempotency key: stable across activity retries and worker restarts. Every
+        # account opening gets its own workflow ID (OpenAccount-...-<n>), and the run
+        # ID keeps the key unique even if a workflow ID were ever started again.
         transfer_id = f"{workflow.info().workflow_id}-{workflow.info().run_id}-initial-deposit"
         compensations = []  # (description, activity, args)
         try:
