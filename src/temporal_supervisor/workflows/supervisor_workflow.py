@@ -77,21 +77,6 @@ class ApprovalHook(HookProvider):
 # ---------------------------------------------------------------------------
 # In-workflow tools (run deterministically in the workflow sandbox).
 # ---------------------------------------------------------------------------
-def _slugify(name: str) -> str:
-    """Deterministically reduce a name to a URL/CLI-safe slug for use in IDs.
-
-    The account name is embedded in the child workflow ID for readability, but a
-    raw name can contain spaces or other characters that are awkward to pass on a
-    command line or in a URL. This keeps only alphanumerics, collapses everything
-    else to single hyphens, and caps the length. Pure/deterministic (no I/O), so
-    it is safe to call from workflow context.
-    """
-    slug = "".join(c if (c.isascii() and c.isalnum()) else "-" for c in name.lower())
-    while "--" in slug:
-        slug = slug.replace("--", "-")
-    return slug.strip("-")[:40] or "account"
-
-
 KYC_NOT_APPROVED = (
     "KYC was not approved. First show the customer their current details for this account "
     "opening (get_current_client_info) and ask whether they are correct. Approve KYC only "
@@ -176,8 +161,9 @@ class WealthManagementWorkflow:
         # gets the real status instead of relying on what it remembers.
         self._account_opening_states: dict = {}
         self._account_opening_names: dict = {}
-        # Number of account openings started in this conversation, used in their
-        # child workflow IDs.
+        # Number of account openings started in this conversation. Each opening's
+        # child workflow ID ends with its number, so every request to open an
+        # account starts a new child workflow, even for the same account name.
         self._account_openings_started = 0
         # Number of the customer message being processed, and the message in which
         # each account opening's client details were shown, keyed by its workflow
@@ -362,14 +348,15 @@ class WealthManagementWorkflow:
                 initial_amount=initial_amount,
                 promo_code=promo_code,
             )
-            # Slugify the account name for the ID only; the account keeps its real name
-            # via account_input above. The number keeps the ID unique when the same
-            # account name is opened again in this conversation, and keeps it short
-            # enough to type into the compliance-approval script.
-            self._account_openings_started += 1
+            # Same format as the other ports. The number counts the account openings
+            # started in this conversation (this one included), so every request to open
+            # an account starts a new child workflow with its own KYC, even when an
+            # opening with the same name is still running or has finished. It is kept in
+            # workflow state, so it replays the same, and counts only openings that
+            # were started (not ones refused above).
+            opening_number = self._account_openings_started + 1
             child_workflow_id = (
-                f"open-account-{workflow.info().workflow_id}-{_slugify(account_name)}"
-                f"-{self._account_openings_started}"
+                f"OpenAccount-{workflow.info().workflow_id}-{client_id}-{account_name}-{opening_number}"
             )
             # TERMINATE matches the other ports: ending the conversation stops its pending
             # account openings.
@@ -380,6 +367,11 @@ class WealthManagementWorkflow:
                 parent_close_policy=ParentClosePolicy.TERMINATE,
                 task_queue=OPEN_ACCOUNT_TASK_QUEUE,
             )
+            self._account_openings_started = opening_number
+            # Known from the start, so a status check right away doesn't report "not found"
+            # before the child's first state update arrives.
+            self._account_opening_states.setdefault(child_workflow_id, "Initializing")
+            self._account_opening_names.setdefault(child_workflow_id, account_name)
             # A bare ID reads like success, and the model told customers their account
             # was open. Say plainly that it is not.
             return (

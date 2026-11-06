@@ -1,8 +1,9 @@
-"""Live test of opening an account, against the real Gemini model.
+"""Live tests of opening an account, against the real Gemini model.
 
-The customer opens a Vacation account, confirms their details, and compliance
-approves it. The custodian then rejects the account, so the saga rolls it back.
-The customer asks to open Vacation again. Checked:
+test_open_account_after_a_rollback: the customer opens a Vacation account,
+confirms their details, and compliance approves it. The custodian then rejects
+the account, so the saga rolls it back. The customer asks to open Vacation
+again. Checked:
 
   - No agent tells the customer the account is open before it is.
   - After the rollback, the new request starts a new account opening (with its
@@ -10,9 +11,17 @@ The customer asks to open Vacation again. Checked:
     compliance review.
   - Account-opening replies don't end with the "open, close, or list" next steps,
     which don't fit a reply that asks the customer to confirm their details.
-  - Each opening's child workflow ID ends with the account name and a count, not a
-    UUID.
+  - Each opening's child workflow ID is OpenAccount-<chat ID>-<client ID>-<account
+    name>-<n>, as in the other ports, where n counts the openings started in the
+    conversation: the reopened account gets a new ID (...-Vacation-1, then -2).
   - Listing the investments afterwards puts each account on its own line.
+
+test_open_the_same_account_twice: the customer asks about their beneficiaries,
+gives client ID 123, asks about their investments, opens Vacation with $13,000,
+confirms their details (the opening waits for compliance review), then asks to
+open Vacation with $13,000 again. Checked: both requests show the client's
+details for KYC ("Don", "123 Main Street"), and two child workflows were started,
+ending -Vacation-1 and -Vacation-2.
 
 The model decides what to say, so this can't be checked with a scripted model.
 It runs the real ``WealthManagementWorkflow`` and ``OpenInvestmentAccountWorkflow``
@@ -27,7 +36,8 @@ Not part of the default ``uv run pytest`` run, because it calls the paid Gemini 
 
     source ./setgeminikey.sh && uv run pytest tests/live_account_opening.py -s
 
-LIVE_TEST_RUNS=<n> repeats the conversation n times (default 1), since model output
+Add ``-k same_account_twice`` (or ``-k rollback``) to run one of them.
+LIVE_TEST_RUNS=<n> repeats each conversation n times (default 1), since model output
 varies. Skipped when GEMINI_API_KEY is not set. Requires the Temporal test server
 (downloaded automatically on first run); no Redis needed.
 """
@@ -58,6 +68,7 @@ from live_agent_handoffs import (
     stub_append_status_update,
     stub_delete_conversation,
 )
+from temporal_supervisor.activities.beneficiaries import Beneficiaries
 from temporal_supervisor.activities.clients import ClientActivities
 from temporal_supervisor.activities.investments import Investments
 from temporal_supervisor.model_config import LLM_TASK_QUEUE, MODEL_NAME, OPEN_ACCOUNT_TASK_QUEUE
@@ -68,6 +79,7 @@ RUNS = max(1, int(os.getenv("LIVE_TEST_RUNS", "1")))
 # The supervisor starts the child on OPEN_ACCOUNT_TASK_QUEUE; run both there.
 TASK_QUEUE = OPEN_ACCOUNT_TASK_QUEUE
 CLIENT_FIRST_NAME = "Don"  # client 123 in data/clients.json
+CLIENT_ADDRESS = "123 Main Street"
 
 pytestmark = pytest.mark.skipif(
     not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")),
@@ -147,6 +159,7 @@ async def stub_register(client_id: str, investment_id: str, amount: float) -> st
 
 
 ACTIVITIES = [
+    Beneficiaries.list_beneficiaries,  # read-only
     Investments.list_investments,
     Investments.validate_new_account,
     Investments.find_promotion,
@@ -257,8 +270,10 @@ async def _run_conversation(env: WorkflowEnvironment, run: int) -> dict:
             failures.append("the client details were not shown for the second opening")
 
         await say("Yes")
-        expected = [f"open-account-{handle.id}-vacation-1", f"open-account-{handle.id}-vacation-2"]
-        if KYC_APPROVED != expected:
+        # Every opening gets a new ID. The model picks the account name's case, so
+        # compare case-insensitively.
+        expected = [f"OpenAccount-{handle.id}-123-Vacation-1", f"OpenAccount-{handle.id}-123-Vacation-2"]
+        if [w.lower() for w in KYC_APPROVED] != [w.lower() for w in expected]:
             failures.append(f"KYC approved for {KYC_APPROVED}, expected {expected}")
 
         reply, _ = await say("list investments")
@@ -274,19 +289,104 @@ async def _run_conversation(env: WorkflowEnvironment, run: int) -> dict:
     return {"run": run, "failures": failures, "transcript": text}
 
 
-async def test_open_account_after_a_rollback(temporal_env):
+async def _child_workflow_ids(env: WorkflowEnvironment, parent_id: str) -> list:
+    """IDs of the open-account child workflows started by the chat workflow."""
+    ids: list = []
+    for _ in range(40):  # visibility is eventually consistent
+        ids = sorted(
+            [
+                w.id
+                async for w in env.client.list_workflows(
+                    "WorkflowType='OpenInvestmentAccountWorkflow'"
+                )
+                if w.parent_id == parent_id
+            ]
+        )
+        if len(ids) >= 2:
+            break
+        await asyncio.sleep(0.25)
+    return ids
+
+
+async def _run_same_account_twice(env: WorkflowEnvironment, run: int) -> dict:
+    """The six-message conversation. Returns the result; never raises on a failed check."""
+    transcript: list = []
+    failures: list = []
+    KYC_APPROVED.clear()
+
+    handle = await env.client.start_workflow(
+        WealthManagementWorkflow.run,
+        id=f"account-opening-twice-live-{run}-{uuid.uuid4()}",
+        task_queue=TASK_QUEUE,
+    )
+
+    async def say(text: str) -> tuple[str, list]:
+        reply, calls = await _send(handle, text)
+        transcript.extend([f"Customer: {text}", f"Agent: {reply}", "  trace:", _trace(calls)])
+        return reply, calls
+
+    def kyc_shown(reply: str, which: str) -> None:
+        for detail in (CLIENT_FIRST_NAME, CLIENT_ADDRESS):
+            if detail not in reply:
+                failures.append(f"the reply to the {which} request did not show {detail!r}: {reply!r}")
+
+    try:
+        await say("Who are my beneficiaries?")
+        await say("123")
+        await say("what investments do I have?")
+
+        reply, calls = await say("Open Vacation with $13,000")
+        if "open_new_investment_account" not in _open_account_tools(calls):
+            failures.append("the first request did not start an account opening")
+        kyc_shown(reply, "first")
+
+        await say("Yes")
+        if len(KYC_APPROVED) != 1:
+            failures.append(f"KYC approved {len(KYC_APPROVED)} times after 'Yes', expected 1")
+
+        reply, calls = await say("Open Vacation with $13,000")
+        if "open_new_investment_account" not in _open_account_tools(calls):
+            failures.append("the second request did not start a new account opening")
+        kyc_shown(reply, "second")
+
+        child_ids = await _child_workflow_ids(env, handle.id)
+        transcript.append(f"  (child workflows started: {child_ids})")
+        # The model picks the account name's case, so compare case-insensitively.
+        ids = sorted(w.lower() for w in child_ids)
+        if not (len(ids) == 2 and ids[0].endswith("-vacation-1") and ids[1].endswith("-vacation-2")):
+            failures.append(f"child workflows {child_ids}, expected IDs ending -Vacation-1 and -Vacation-2")
+        if len(KYC_APPROVED) != 1:
+            failures.append(f"the second opening's KYC was approved without a confirmation: {KYC_APPROVED}")
+    finally:
+        await handle.signal(WealthManagementWorkflow.end_workflow)
+        await handle.result()
+
+    text = f"\nRun {run} of {RUNS}:\n" + "\n".join(transcript)
+    print(text)
+    return {"run": run, "failures": failures, "transcript": text}
+
+
+async def _run_all(env: WorkflowEnvironment, conversation, name: str) -> None:
     results = []
     async with Worker(
-        temporal_env.client,
+        env.client,
         task_queue=TASK_QUEUE,
         workflows=[WealthManagementWorkflow, OpenInvestmentAccountWorkflow],
         activities=ACTIVITIES,
-    ), Worker(temporal_env.client, task_queue=LLM_TASK_QUEUE):  # the model calls run here
+    ), Worker(env.client, task_queue=LLM_TASK_QUEUE):  # the model calls run here
         for run in range(1, RUNS + 1):
-            results.append(await _run_conversation(temporal_env, run))
+            results.append(await conversation(env, run))
 
     failed = [r for r in results if r["failures"]]
-    print(f"\nLive account opening: {RUNS - len(failed)}/{RUNS} runs passed")
+    print(f"\n{name}: {RUNS - len(failed)}/{RUNS} runs passed")
     assert not failed, "\n".join(
         f"Run {r['run']} failed: {'; '.join(r['failures'])}{r['transcript']}" for r in failed
     )
+
+
+async def test_open_account_after_a_rollback(temporal_env):
+    await _run_all(temporal_env, _run_conversation, "Live account opening after a rollback")
+
+
+async def test_open_the_same_account_twice(temporal_env):
+    await _run_all(temporal_env, _run_same_account_twice, "Live opening of the same account twice")

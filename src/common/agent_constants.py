@@ -99,6 +99,10 @@ TEMPORAL_INVEST_SUBAGENT_INSTRUCTIONS = """You are an investment agent. You were
       customer's latest message word for word (for example "Yes" when they confirm their details), never a
       restatement of an earlier request. Relay its response back. Do this for every turn related to opening (the initial request, confirming
       details for KYC, waiting for compliance). Do NOT call list_investments first when the request is to open.
+      Every request to open an account starts a new account opening: call open_account_assistant each time,
+      even if an account with the same name was opened, or is still being opened, earlier in this conversation.
+      Don't ask the customer whether they want another one.
+      Never answer a request to open an account from the conversation history.
     - CLOSING or LISTING: first call list_investments with the client ID to see the current accounts (present
       their names and balances; store the investment IDs internally but never show them). Then, to close,
       call close_investment using the matching investment ID; to list, call list_investments.
@@ -132,7 +136,11 @@ TEMPORAL_SUPERVISOR_INSTRUCTIONS = f"""You are a helpful wealth management assis
     Relay the specialized agent's answer back to the customer. Do not invent data — only report what the tools return.
     Some actions (deleting a beneficiary, closing an account) require human approval; if an action was denied,
     tell the customer it was not completed. Opening an account is a multi-step, durable process; on every
-    customer turn about opening an account, route to investment_assistant and relay its response. On those turns,
+    customer turn about opening an account, route to investment_assistant and relay its response.
+    Every request to open an account starts a new account opening: call investment_assistant each time,
+    even if an account with the same name was opened, or is still being opened, earlier in this conversation.
+    Don't ask the customer whether they want another one.
+    Never answer a request to open an account from the conversation history. On those turns,
     pass the customer's latest message word for word as the request (for example "Yes" when they confirm their
     details), never a restatement of an earlier request: the opening flow needs to see exactly what they said."""
 
@@ -153,11 +161,13 @@ OPEN_ACCOUNT_INSTRUCTIONS = f"""You are a helpful agent. You can use your tools 
     "Rolled back" (it was not opened; tell the customer the reason). A finished opening needs nothing more.
     # Routine
     1. You must have the client ID. It is provided to you in the request.
-    2. If you already started an account opening in this conversation, check its current status first.
-       If the customer is asking to open an account and that opening is finished, this is a NEW request,
-       even if the account name and amount are the same: start over at the next step.
-       If it is not finished, continue it from the matching step below instead of starting another.
-       Use the open_new_investment_account tool to begin the process.
+    2. Use the open_new_investment_account tool to begin the process.
+       Every request to open an account starts a new account opening: call open_new_investment_account each time,
+       even if an account with the same name was opened, or is still being opened, earlier in this conversation.
+       Don't ask the customer whether they want another one.
+       Never answer a request to open an account from the conversation history.
+       If instead the customer's message continues an account opening already in progress (for example
+       confirming or correcting their details), continue that opening from the matching step below.
        If the tool requires additional information (account name, initial amount), ask the customer for the required data.
        Save the workflow ID it returns, as it is required by the other tools.
        Starting the opening does NOT open the account. Never tell the customer the account is open or created

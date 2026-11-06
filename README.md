@@ -112,6 +112,9 @@ The Java open-account workflow has its own tests (JDK 25): `cd java && ./gradlew
 A separate live test of the agent routing calls the paid Gemini API and is not part
 of that run: `source ./setgeminikey.sh && uv run pytest tests/live_agent_handoffs.py -s`
 (see [src/temporal_supervisor/README.md](src/temporal_supervisor/README.md#live-agent-routing-test-calls-the-paid-gemini-api)).
+Live tests of opening an account (reopening it after a rollback, and opening the same
+account name twice, each with its own KYC) also call the paid API: `source ./setgeminikey.sh && uv run pytest tests/live_account_opening.py -s`
+(see [src/temporal_supervisor/README.md](src/temporal_supervisor/README.md#live-account-opening-test-calls-the-paid-gemini-api)).
 
 ## Resetting the demo data
 

@@ -6,7 +6,7 @@ Python version in [`src/temporal_supervisor/workflows/open_account_workflow.py`]
 same workflow type, query (`get_current_state`), updates (`get_client_details`, `update_client_details`)
 and signals (`verify_kyc`, `compliance_approved`), same states and messages, same saga (create the
 account record, debit the linked bank account, register with the custodian, with compensations in
-reverse order), the same transfer IDs (`<workflow ID>-initial-deposit`, refunds `...-refund`), and the
+reverse order), the same transfer IDs (`<workflow ID>-<run ID>-initial-deposit`, refunds `...-refund`), and the
 same `update_account_opening_state` signals to the parent chat workflow (`account_name`, `state`,
 `workflow_id`). Without a parent (for example when started by `run_open_account_workflow.py`), it
 signals nothing.

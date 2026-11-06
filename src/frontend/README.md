@@ -39,3 +39,14 @@ npm start     # http://localhost:3000
 The API base URL is configured in [`src/config.js`](src/config.js)
 (`http://127.0.0.1:8000` by default). The API's CORS settings allow the frontend on
 port 3000 (`localhost` or `127.0.0.1`).
+
+## Tests
+
+```bash
+cd src/frontend
+npm test
+```
+
+`npm test` starts Jest in watch mode; press `q` to quit (or run `CI=true npm test` to run once).
+The smoke test (`src/App.test.js`) renders the app and checks that the chat starts with a
+**Start Chat** button and a disabled message box; it needs no backend.
