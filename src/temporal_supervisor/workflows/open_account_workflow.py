@@ -77,7 +77,10 @@ class OpenInvestmentAccountWorkflow:
         """
         amount = inputs.initial_amount
         bonus = self._welcome_bonus(inputs) if inputs.promo_code else 0.0
-        transfer_id = f"{workflow.info().workflow_id}-initial-deposit"
+        # Idempotency key: stable across activity retries and worker restarts. It
+        # includes the run ID because the workflow ID is reused when the customer
+        # opens an account with the same name again (e.g. after a rollback).
+        transfer_id = f"{workflow.info().workflow_id}-{workflow.info().run_id}-initial-deposit"
         compensations = []  # (description, activity, args)
         try:
             await self._set_state("Creating the account record.")

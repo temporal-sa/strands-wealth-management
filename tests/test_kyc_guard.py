@@ -21,13 +21,13 @@ import pytest
 from strands.models import Model
 from strands.types.content import Messages
 from strands.types.streaming import StreamEvent
-from temporalio import activity
+from temporalio import activity, workflow
 from temporalio.contrib.strands import StrandsPlugin
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
+from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
 from common.user_message import ProcessUserMessageInput
-from temporal_supervisor.model_config import LLM_TASK_QUEUE
+from temporal_supervisor.model_config import LLM_TASK_QUEUE, OPEN_ACCOUNT_TASK_QUEUE
 from temporal_supervisor.workflows.supervisor_workflow import (
     WealthManagementWorkflow,
     kyc_confirmed,
@@ -35,8 +35,8 @@ from temporal_supervisor.workflows.supervisor_workflow import (
 
 TASK_QUEUE = "test-kyc-guard"
 CLIENT_ID = "123"
-CAR = "open-account-test-123-car"
-VACATION = "open-account-test-123-vacation"
+CAR = "OpenAccount-test-123-Car"
+VACATION = "OpenAccount-test-123-Vacation"
 
 # Account openings that KYC was approved for, in order, recorded worker-side.
 APPROVED: list = []
@@ -164,8 +164,34 @@ async def stub_delete_conversation(workflow_id: str) -> bool:
     return True
 
 
+@activity.defn(name="validate_new_account")
+async def stub_validate_new_account(client_id: str, account_name: str, initial_amount: float) -> None:
+    return None
+
+
+@activity.defn(name="find_promotion")
+async def stub_find_promotion(client_id: str) -> None:
+    return None
+
+
+@workflow.defn(name="OpenInvestmentAccountWorkflow")
+class StubOpenAccountWorkflow:
+    """Stands in for the open-account child: runs until it is told to finish."""
+
+    def __init__(self) -> None:
+        self.finished = False
+
+    @workflow.run
+    async def run(self, inputs: Any) -> None:
+        await workflow.wait_condition(lambda: self.finished)
+
+    @workflow.signal
+    def finish(self) -> None:
+        self.finished = True
+
+
 STUB_ACTIVITIES = [
-    stub_get_current_client_info, stub_approve_kyc,
+    stub_get_current_client_info, stub_approve_kyc, stub_validate_new_account, stub_find_promotion,
     stub_append_chat_interaction, stub_append_status_update, stub_delete_conversation,
 ]
 
@@ -244,6 +270,59 @@ async def test_kyc_approved_only_after_the_customer_replies(temporal_env):
         reply = await _send(handle, "Yes, still correct.")
         assert "KYC approved" in reply
         assert APPROVED == [CAR, VACATION]
+
+        assert SCRIPT == []
+        await handle.signal(WealthManagementWorkflow.end_workflow)
+
+
+async def test_reopening_an_account_reuses_its_workflow_id(temporal_env):
+    # The child workflow ID is OpenAccount-<chat ID>-<client ID>-<account name>, as in
+    # the other ports. Opening the same name again fails while the first opening is
+    # running, and starts a new run with the same ID once it has finished, without
+    # carrying over the earlier KYC confirmation.
+    APPROVED.clear()
+    chat_id = f"kyc-guard-test-{uuid.uuid4()}"
+    car = f"OpenAccount-{chat_id}-{CLIENT_ID}-Car"
+    open_car = tool("open_new_investment_account", client_id=CLIENT_ID, account_name="Car", initial_amount=5000.0)
+    SCRIPT[:] = [
+        *delegate(), open_car, *relay(),  # opens Car
+        *delegate(), open_car, *relay(),  # opens Car again while the first is running
+        *delegate(), tool("get_current_client_info", workflow_id=car), *relay(),  # shows the details
+        *delegate(), open_car, *relay(),  # reopens Car after the first finished
+        *delegate(), tool("approve_kyc", workflow_id=car), *relay(),  # approves with no new details shown
+    ]
+
+    worker, llm_worker = _workers(temporal_env)
+    child_worker = Worker(
+        temporal_env.client,
+        task_queue=OPEN_ACCOUNT_TASK_QUEUE,
+        workflows=[StubOpenAccountWorkflow],
+        workflow_runner=UnsandboxedWorkflowRunner(),
+    )
+    async with worker, llm_worker, child_worker:
+        handle = await temporal_env.client.start_workflow(
+            WealthManagementWorkflow.run, id=chat_id, task_queue=TASK_QUEUE,
+        )
+
+        reply = await _send(handle, "Open an account called Car with $5,000.")
+        assert f"Workflow ID: {car}" in reply
+        first_run = (await temporal_env.client.get_workflow_handle(car).describe()).run_id
+
+        reply = await _send(handle, "Open Car with $5,000.")
+        assert "already in progress" in reply and car in reply
+
+        await _send(handle, "Show my details.")
+        child = temporal_env.client.get_workflow_handle(car, run_id=first_run)
+        await child.signal("finish")
+        await child.result()
+
+        reply = await _send(handle, "Open Car with $5,000 again.")
+        assert f"Workflow ID: {car}" in reply
+        assert (await temporal_env.client.get_workflow_handle(car).describe()).run_id != first_run
+
+        reply = await _send(handle, "Yes, that's correct.")
+        assert "KYC was not approved" in reply
+        assert APPROVED == []
 
         assert SCRIPT == []
         await handle.signal(WealthManagementWorkflow.end_workflow)

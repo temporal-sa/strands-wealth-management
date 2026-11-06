@@ -27,7 +27,7 @@ updates as the open-account child workflow progresses.
 | **Tools as Activities** | `activities/` wrapped with `activity_as_tool` |
 | **Child workflow** | The open-account agent starts `OpenInvestmentAccountWorkflow` |
 | **Human approval gate** | `ApprovalHook` interrupts before `delete_beneficiary` / `close_investment`; the workflow waits for an `approve` Signal |
-| **Human compliance gate** | The open-account child blocks on a `compliance_approved` Signal, sent with `sendcomplianceapproval.sh` |
+| **Human compliance gate** | The open-account child blocks on a `compliance_approved` Signal, sent with `localsendcomplianceapproval.sh` (local server) or `sendcomplianceapproval.sh` (Temporal Cloud) |
 | **Updates** | KYC reads and updates client details through the child workflow's `get_client_details` / `update_client_details` Updates |
 | **Conversation history in Redis** | `EventStreamActivities` persist chat + status events the UI polls |
 | **Retries, non-retryable errors, saga** | See [Failure scenarios](#failure-scenarios-chaos-panel) |
@@ -149,7 +149,12 @@ the agent either runs the tool or tells you it wasn't done.
 2. Its `open_new_investment_account` tool checks the business rules
    (`validate_new_account`: at least $100, at most $1,000,000), looks up any
    promotion (`find_promotion`), and starts the `OpenInvestmentAccountWorkflow`
-   child workflow. The child loads the client and waits for KYC.
+   child workflow with the ID `OpenAccount-<chat workflow ID>-<client ID>-<account name>`
+   (the same format as the other ports). The child loads the client and waits for KYC.
+   Opening an account with the same name again reuses that ID: while the first opening
+   is still running the start fails and the agent is told it is already in progress;
+   once it has finished (for example rolled back) a new run starts with the same ID,
+   and its transfer IDs include the run ID so the deposit is moved again.
 3. **KYC:** the agent shows your current details (`get_current_client_info`, an
    Update on the child) and asks whether they are correct. It can approve KYC
    (`approve_kyc`, a `verify_kyc` Signal) only after you confirm in a later
@@ -184,9 +189,8 @@ src/temporal_supervisor/sendcomplianceapproval.sh <child-workflow-id>
 ```
 
 The status text does not include the child workflow ID. Its format is
-`open-account-<chat workflow ID>-<account-name-slug>-<n>`, where `<n>` counts the
-account openings in the chat, for example
-`open-account-strands-temporal-agent-k3j9x2m1q-retirement-1`. To find it, open
+`OpenAccount-<chat workflow ID>-<client ID>-<account name>`, for example
+`OpenAccount-strands-temporal-agent-k3j9x2m1q-123-Vacation`. To find it, open
 the [Temporal UI](http://localhost:8233), look for the **Running**
 `OpenInvestmentAccountWorkflow` (a child of your chat workflow, whose ID starts
 with `strands-temporal-agent-`) and copy its Workflow ID. You can also list them
@@ -195,6 +199,11 @@ with the Temporal CLI:
 ```bash
 temporal workflow list --query "WorkflowType='OpenInvestmentAccountWorkflow' AND ExecutionStatus='Running'"
 ```
+
+The account name is used as is, so quote the ID if it contains spaces, e.g.
+`src/temporal_supervisor/localsendcomplianceapproval.sh "OpenAccount-strands-temporal-agent-k3j9x2m1q-123-Kids College"`.
+An account name opened again after a rollback reuses the ID, so the list shows only the
+running opening, and the Temporal UI shows earlier ones as separate runs of the same ID.
 
 The signal waits until KYC has been approved, so send it after you have confirmed
 your details.
@@ -322,7 +331,7 @@ every flag off.
 | **LLM rate limited (reactive)** | Turn on *Gemini rate limited (429)* and send a message. | The model raises an `ApplicationError` with `next_retry_delay` (15s, like a `Retry-After` header), which overrides the retry policy's backoff. Real Gemini 429s are handled the same way (`ChaosAwareGeminiModel` in `model_config.py`). |
 | **LLM rate limited (proactive)** | Start the worker with `LLM_MAX_CALLS_PER_SECOND=0.2 src/temporal_supervisor/startlocalworker.sh`, then chat in several browser tabs at once. | Model calls run on their own task queue (`wealth-management-strands-llm` by default; set with `TEMPORAL_TASK_QUEUE_LLM`). The Temporal service dispatches at most that many per second across *all* workers, so calls queue up instead of hitting the provider's limit. Tools on the main queue aren't slowed down. |
 | **Business rule (non-retryable)** | Ask to open an account with $2,000,000 (or less than $100). | `validate_new_account` raises a non-retryable `ApplicationError`: one attempt, no retries. The reason goes back to the agent, which explains it to the customer. Compare it with *Tool / API down* in the Temporal UI. |
-| **Saga** | Turn on *Custodian rejects new accounts* (and *Slow account-opening steps* so you can watch), then open an account through compliance approval. Without flags: as client `123`, open an account with $300,000 (the linked bank account has $250,000). | After compliance approval the child workflow creates the account record, transfers the deposit from the linked bank account, and registers with the custodian. When a step fails non-retryably, the completed steps are undone in reverse order (refund, then remove the account). Compensations are activities too, so they are retried until they succeed. Kill the worker mid-rollback and the rollback still finishes. Transfers are idempotent, so a retried debit or refund never moves money twice. |
+| **Saga** | Turn on *Custodian rejects new accounts* (and *Slow account-opening steps* so you can watch), then open an account through compliance approval. Without flags: as client `123`, open an account with $300,000 (the linked bank account has $250,000). | After compliance approval the child workflow creates the account record, transfers the deposit from the linked bank account, and registers with the custodian. When a step fails non-retryably, the completed steps are undone in reverse order (refund, then remove the account). Compensations are activities too, so they are retried until they succeed. Kill the worker mid-rollback and the rollback still finishes. Transfers are idempotent (the transfer ID is `<child workflow ID>-<run ID>-initial-deposit`, refunds `...-refund`), so a retried debit or refund never moves money twice, while reopening an account with the same name after a rollback is a new transfer. |
 | **Bug in workflow code** | Turn on *Bug in workflow code*, then open an account through compliance approval. See below. | The workflow pauses at the failing line, keeping all its state, until a worker with fixed code picks it up. |
 
 ### Bug in the workflow code
@@ -433,8 +442,10 @@ From the project root:
 uv run pytest
 ```
 
-The tests cover the durable approval gate across sub-agents, the KYC guard, the
-failure scenarios (saga rollback, retries, the workflow bug), the off-topic
+The tests cover the durable approval gate across sub-agents, the KYC guard (including
+reopening an account with the same name), the failure scenarios (saga rollback, a new
+transfer ID when an account is reopened, retries, tool and LLM outages retried until
+recovery, the workflow bug), the off-topic
 prompt, and the claim check codec, plugin and codec server and the open-account
 task-queue split (`tests/test_claim_check.py`). They use a scripted model, stub
 activities and an in-memory stand-in for Redis, so no Gemini key or Redis is
@@ -471,6 +482,33 @@ source ./setgeminikey.sh && uv run pytest tests/live_agent_handoffs.py -s
 
 Model output varies, so `LIVE_TEST_RUNS=<n>` repeats the conversation n times
 (default 1), e.g. `LIVE_TEST_RUNS=10 uv run pytest tests/live_agent_handoffs.py -s`.
+
+### Live account-opening test (calls the paid Gemini API)
+
+`tests/live_account_opening.py` runs the real `WealthManagementWorkflow` and
+`OpenInvestmentAccountWorkflow` against the real Gemini model. The customer gives
+client ID "123", opens a Vacation account with $18,500 and confirms their details;
+the test then sends the compliance approval, the custodian rejects the account and
+the saga rolls it back. The customer opens Vacation again ($15,000), confirms, and
+lists their investments. The test checks that no agent says the account is open
+before it is, that the second request starts a new account opening with its own KYC
+instead of reporting the rolled-back one as pending, that account-opening replies
+don't end with the "open, close, or list" next steps, that both openings use the
+child workflow ID `OpenAccount-<chat workflow ID>-123-Vacation`, and that each
+investment is listed on its own line. The read-only activities use the real
+`data/*.json`; the saga steps (the custodian always rejects), the KYC activities,
+the Redis-backed event stream and the chaos flags are stubbed, so it never changes
+the data files and needs no Redis.
+
+Like the routing test, it is not part of `uv run pytest` and is skipped when
+`GEMINI_API_KEY` is not set. Each run is a six-message conversation through up to
+three nested agents, so it makes many more model calls than the routing test and
+costs correspondingly more; `LIVE_TEST_RUNS=<n>` multiplies that. Run it from the
+project root with:
+
+```bash
+source ./setgeminikey.sh && uv run pytest tests/live_account_opening.py -s
+```
 
 ## Run on Temporal Cloud
 

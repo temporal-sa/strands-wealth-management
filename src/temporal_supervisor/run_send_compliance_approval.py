@@ -23,7 +23,7 @@ async def approve(workflow_id: str):
 def main():
     parser = argparse.ArgumentParser(
         description="Send the compliance-approved signal to an open-account child workflow.",
-        epilog="Example: uv run python src/temporal_supervisor/run_send_compliance_approval.py --workflow-id open-account-...",
+        epilog="Example: uv run python src/temporal_supervisor/run_send_compliance_approval.py --workflow-id OpenAccount-...",
     )
     parser.add_argument("--workflow-id", type=str, required=True, help="The open-account child workflow ID")
     args = parser.parse_args()

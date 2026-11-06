@@ -10,8 +10,8 @@ The customer asks to open Vacation again. Checked:
     compliance review.
   - Account-opening replies don't end with the "open, close, or list" next steps,
     which don't fit a reply that asks the customer to confirm their details.
-  - Each opening's child workflow ID ends with the account name and a count, not a
-    UUID.
+  - Each opening's child workflow ID is OpenAccount-<chat ID>-<client ID>-<account
+    name>, as in the other ports, so the reopened account reuses the ID.
   - Listing the investments afterwards puts each account on its own line.
 
 The model decides what to say, so this can't be checked with a scripted model.
@@ -257,8 +257,9 @@ async def _run_conversation(env: WorkflowEnvironment, run: int) -> dict:
             failures.append("the client details were not shown for the second opening")
 
         await say("Yes")
-        expected = [f"open-account-{handle.id}-vacation-1", f"open-account-{handle.id}-vacation-2"]
-        if KYC_APPROVED != expected:
+        # The model picks the account name's case, so compare case-insensitively.
+        expected = [f"OpenAccount-{handle.id}-123-Vacation"] * 2
+        if [w.lower() for w in KYC_APPROVED] != [w.lower() for w in expected]:
             failures.append(f"KYC approved for {KYC_APPROVED}, expected {expected}")
 
         reply, _ = await say("list investments")

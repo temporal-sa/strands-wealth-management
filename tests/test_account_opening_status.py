@@ -34,7 +34,7 @@ from temporal_supervisor.workflows.supervisor_workflow import WealthManagementWo
 
 TASK_QUEUE = "test-account-opening-status"
 CLIENT_ID = "123"
-VACATION = "open-account-test-123-vacation"
+VACATION = "OpenAccount-test-123-Vacation"
 WAITING = "Waiting Compliance Review"
 ROLLED_BACK = "Rolled back. The account was not opened: The custodian rejected the account registration."
 

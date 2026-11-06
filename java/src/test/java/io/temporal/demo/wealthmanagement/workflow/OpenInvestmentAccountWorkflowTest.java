@@ -218,6 +218,11 @@ class OpenInvestmentAccountWorkflowTest {
         return client.newWorkflowStub(OpenInvestmentAccountWorkflow.class, workflowId).get_current_state();
     }
 
+    /** Run ID of the latest run with this workflow ID. */
+    private String runId(String workflowId) {
+        return client.newUntypedWorkflowStub(workflowId).describe().getExecution().getRunId();
+    }
+
     private List<HistoryEvent> history(String workflowId) {
         return client.fetchHistory(workflowId).getEvents();
     }
@@ -229,8 +234,8 @@ class OpenInvestmentAccountWorkflowTest {
         assertEquals("investment account created", result.getMessage());
         assertEquals("Complete", state("happy-path"));
         assertEquals(List.of("get_client", "open_investment#1", "debit:500.0", "register"), CALLS);
-        // Same transfer ID as the Python workflow: one per account opening (workflow ID)
-        assertEquals(List.of("happy-path-initial-deposit"), TRANSFER_IDS);
+        // Same transfer ID as the Python workflow: one per account opening (workflow ID and run ID)
+        assertEquals(List.of("happy-path-" + runId("happy-path") + "-initial-deposit"), TRANSFER_IDS);
         InvestmentAccount account = (InvestmentAccount) LAST_ARGS.get("open_investment");
         assertEquals(CLIENT_ID, account.getClientId());
         assertEquals("Test", account.getName());
@@ -246,7 +251,8 @@ class OpenInvestmentAccountWorkflowTest {
         assertEquals("Rolled back. The account was not opened: register_account rejected.", state("custodian-rejects"));
         assertEquals(List.of("get_client", "open_investment#1", "debit:500.0", "register",
                 "credit:500.0", "remove_investment:" + INVESTMENT_ID), CALLS);
-        assertEquals(List.of("custodian-rejects-initial-deposit", "custodian-rejects-initial-deposit-refund"), TRANSFER_IDS);
+        String transferId = "custodian-rejects-" + runId("custodian-rejects") + "-initial-deposit";
+        assertEquals(List.of(transferId, transferId + "-refund"), TRANSFER_IDS);
     }
 
     @Test
@@ -269,16 +275,21 @@ class OpenInvestmentAccountWorkflowTest {
     }
 
     @Test
-    void reopeningAfterARollbackUsesANewTransferId() {
-        // The supervisor gives every account opening its own workflow ID (open-account-...-<n>), so
-        // opening the account again after a rollback is a new transfer, not a repeat of the refunded one.
+    void reopeningWithTheSameWorkflowIdUsesANewTransferId() {
+        // The supervisor reuses the workflow ID (OpenAccount-<chat>-<client>-<account name>) when the
+        // same account name is opened again, so the transfer ID includes the run ID: opening the
+        // account again after a rollback is a new transfer, not a repeat of the refunded one.
+        String workflowId = "OpenAccount-chat-1-" + CLIENT_ID + "-Vacation";
         FAILURES.put("register_account", "reject");
-        assertFalse(openAccount("open-account-chat-1-vacation-1").isAccount_created());
+        assertFalse(openAccount(workflowId).isAccount_created());
+        String firstRun = runId(workflowId);
         FAILURES.clear();
-        assertTrue(openAccount("open-account-chat-1-vacation-2").isAccount_created());
-        assertEquals(List.of("open-account-chat-1-vacation-1-initial-deposit",
-                "open-account-chat-1-vacation-1-initial-deposit-refund",
-                "open-account-chat-1-vacation-2-initial-deposit"), TRANSFER_IDS);
+        assertTrue(openAccount(workflowId).isAccount_created());
+        String secondRun = runId(workflowId);
+        assertNotEquals(firstRun, secondRun);
+        assertEquals(List.of(workflowId + "-" + firstRun + "-initial-deposit",
+                workflowId + "-" + firstRun + "-initial-deposit-refund",
+                workflowId + "-" + secondRun + "-initial-deposit"), TRANSFER_IDS);
         assertNotEquals(TRANSFER_IDS.get(0), TRANSFER_IDS.get(2));
     }
 
@@ -304,7 +315,7 @@ class OpenInvestmentAccountWorkflowTest {
 
     @Test
     void everyStateIsSignalledToTheParent() throws InterruptedException {
-        String childId = "open-account-parent-test-1";
+        String childId = "OpenAccount-parent-test-" + CLIENT_ID + "-Test";
         TestParentWorkflow parent = client.newWorkflowStub(TestParentWorkflow.class,
                 WorkflowOptions.newBuilder().setWorkflowId("parent-test").setTaskQueue(OPEN_ACCOUNT_QUEUE).build());
         WorkflowClient.start(parent::run, input(null), childId);

@@ -2,7 +2,9 @@
 
 The saga tests run the real ``OpenInvestmentAccountWorkflow`` against stub
 activities (registered under the real activity names) that record the order they
-were called in and fail on demand, so no Redis or data files are touched.
+were called in and fail on demand, so no Redis or data files are touched. The
+outage tests turn chaos flags on without Redis (see the ``outages`` fixture); the
+tool-outage recovery test reads data/investments.json but never writes it.
 
 Requires the Temporal test server (downloaded automatically on first run). No
 GEMINI_API_KEY or Redis needed.
@@ -11,22 +13,26 @@ GEMINI_API_KEY or Redis needed.
 import asyncio
 import json
 import uuid
+from datetime import timedelta
 from typing import Any
 
 import pytest
 from strands.models.gemini import GeminiModel
 from strands.types.exceptions import ModelThrottledException
-from temporalio import activity
+from temporalio import activity, workflow
 from temporalio.api.enums.v1 import EventType
 from temporalio.client import WorkflowExecutionStatus
 from temporalio.contrib.strands import StrandsPlugin
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
-from temporalio.worker import Worker
+from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
+import temporal_supervisor.chaos as chaos
 import temporal_supervisor.model_config as model_config
+from common.chaos_manager import ChaosFlag
 from common.funding_manager import FundingManager, InsufficientFundsError
 from temporal_supervisor.activities.investments import Investments
+from temporal_supervisor.retry_policies import LLM_RETRY_POLICY, TOOL_RETRY_POLICY
 from temporal_supervisor.workflows.open_account_workflow import (
     OpenInvestmentAccountInput,
     OpenInvestmentAccountWorkflow,
@@ -38,6 +44,8 @@ INVESTMENT_ID = "i-test"
 
 # Activity calls, in order, recorded worker-side (same process as the test).
 CALLS: list = []
+# Transfer IDs passed to debit_linked_account, across tests.
+TRANSFER_IDS: list = []
 # Per-test failure behavior, keyed by activity name: "reject" raises a
 # non-retryable error; an int N fails the first N attempts with a transient error.
 FAILURES: dict = {}
@@ -76,6 +84,7 @@ async def stub_remove_investment(client_id: str, investment_id: str) -> bool:
 @activity.defn(name="debit_linked_account")
 async def stub_debit(client_id: str, amount: float, transfer_id: str) -> dict:
     CALLS.append(f"debit:{amount}")
+    TRANSFER_IDS.append(transfer_id)
     _maybe_fail("debit_linked_account")
     return {}
 
@@ -106,7 +115,7 @@ async def temporal_env():
         yield env
 
 
-async def _start_and_approve(env: WorkflowEnvironment, failures: dict, promo_code=None):
+async def _start_and_approve(env: WorkflowEnvironment, failures: dict, promo_code=None, workflow_id=None):
     CALLS.clear()
     FAILURES.clear()
     FAILURES.update(failures)
@@ -115,7 +124,7 @@ async def _start_and_approve(env: WorkflowEnvironment, failures: dict, promo_cod
         OpenInvestmentAccountInput(
             client_id=CLIENT_ID, account_name="Test", initial_amount=500.0, promo_code=promo_code
         ),
-        id=f"open-account-test-{uuid.uuid4()}",
+        id=workflow_id or f"open-account-test-{uuid.uuid4()}",
         task_queue=TASK_QUEUE,
     )
     await handle.signal(OpenInvestmentAccountWorkflow.verify_kyc)
@@ -176,6 +185,19 @@ async def test_transient_failures_are_retried_not_rolled_back(temporal_env):
     ]
 
 
+async def test_reopening_with_the_same_workflow_id_uses_a_new_transfer_id(temporal_env):
+    # The open-account tool reuses the workflow ID for the same account name, so a
+    # retry after a rollback must not look like a repeat of the earlier transfer.
+    workflow_id = f"open-account-test-{uuid.uuid4()}"
+    TRANSFER_IDS.clear()
+    async with _worker(temporal_env):
+        for failures in ({"register_account": "reject"}, {}):
+            handle = await _start_and_approve(temporal_env, failures, workflow_id=workflow_id)
+            await handle.result()
+    assert len(TRANSFER_IDS) == 2
+    assert TRANSFER_IDS[0] != TRANSFER_IDS[1]
+
+
 @pytest.mark.parametrize(
     "amount, error_type",
     [(50.0, "DepositBelowMinimum"), (2_000_000.0, "DepositLimitExceeded")],
@@ -205,6 +227,119 @@ def test_funding_transfers_are_idempotent(tmp_path):
     FundingManager(funding_file).credit(CLIENT_ID, 400.0, "t-1-refund")
     FundingManager(funding_file).credit(CLIENT_ID, 400.0, "t-1-refund")
     assert FundingManager(funding_file).get_account(CLIENT_ID)["balance"] == 1000.0
+
+
+# --------------------------------------------------------------------------- #
+# Outages: the "Tool down" and "LLM down" chaos flags. A down dependency raises
+# a retryable error, and the activity is retried until the dependency recovers.
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def outages(monkeypatch):
+    """Turn chaos flags on without Redis: ``outages[flag] = n`` makes the next n
+    checks of that flag find it on (an outage that ends after n attempts)."""
+    remaining: dict = {}
+
+    async def is_enabled(flag: ChaosFlag) -> bool:
+        if remaining.get(flag, 0) > 0:
+            remaining[flag] -= 1
+            return True
+        return False
+
+    class NoRedisChaosManager:
+        async def record_event(self, *_args: Any) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(chaos, "is_enabled", is_enabled)
+    monkeypatch.setattr(chaos, "ChaosManager", NoRedisChaosManager)
+    return remaining
+
+
+def _model() -> model_config.ChaosAwareGeminiModel:
+    return model_config.ChaosAwareGeminiModel(client_args={"api_key": "test"}, model_id="test")
+
+
+@pytest.fixture
+def gemini_replies(monkeypatch):
+    """Gemini answers without a network call, once the chaos checks pass."""
+
+    async def reply(*_args, **_kwargs):
+        yield {"messageStart": {"role": "assistant"}}
+        yield {"messageStop": {"stopReason": "end_turn"}}
+
+    monkeypatch.setattr(GeminiModel, "stream", reply)
+
+
+@activity.defn(name="test_call_model")
+async def call_model() -> int:
+    """One model call, as the plugin's model activity makes it."""
+    return len([event async for event in _model().stream([])])
+
+
+@workflow.defn(sandboxed=False)
+class OutageRecoveryWorkflow:
+    """Calls a tool or the model with the retry policy the agents use."""
+
+    @workflow.run
+    async def run(self, dependency: str) -> int:
+        if dependency == "tool":
+            accounts = await workflow.execute_activity(
+                Investments.list_investments, "123",
+                start_to_close_timeout=timedelta(seconds=5), retry_policy=TOOL_RETRY_POLICY,
+            )
+            return len(accounts)
+        return await workflow.execute_activity(
+            call_model, start_to_close_timeout=timedelta(seconds=5), retry_policy=LLM_RETRY_POLICY,
+        )
+
+
+async def _run_through_outage(env: WorkflowEnvironment, dependency: str) -> int:
+    async with Worker(
+        env.client,
+        task_queue=f"{TASK_QUEUE}-outage",
+        workflows=[OutageRecoveryWorkflow],
+        activities=[Investments.list_investments, call_model],
+        workflow_runner=UnsandboxedWorkflowRunner(),
+    ):
+        return await env.client.execute_workflow(
+            OutageRecoveryWorkflow.run, dependency,
+            id=f"outage-test-{uuid.uuid4()}", task_queue=f"{TASK_QUEUE}-outage",
+        )
+
+
+async def test_tool_down_raises_a_retryable_error(outages):
+    outages[ChaosFlag.TOOL_DOWN] = 1
+    with pytest.raises(ConnectionError):
+        await ActivityEnvironment().run(Investments.list_investments, CLIENT_ID)
+
+
+async def test_tool_down_is_retried_until_the_tool_recovers(temporal_env, outages):
+    outages[ChaosFlag.TOOL_DOWN] = 2  # the first two attempts fail
+    assert await _run_through_outage(temporal_env, "tool") > 0
+    assert outages[ChaosFlag.TOOL_DOWN] == 0
+
+
+async def test_llm_down_raises_a_retryable_error(outages, gemini_replies):
+    outages[ChaosFlag.LLM_DOWN] = 1
+    with pytest.raises(ConnectionError):
+        await ActivityEnvironment().run(call_model)
+
+
+async def test_llm_down_is_retried_until_the_model_recovers(temporal_env, outages, gemini_replies):
+    outages[ChaosFlag.LLM_DOWN] = 2  # the first two attempts fail
+    assert await _run_through_outage(temporal_env, "llm") == 2
+    assert outages[ChaosFlag.LLM_DOWN] == 0
+
+
+async def test_llm_rate_limit_waits_for_retry_after(outages, gemini_replies):
+    outages[ChaosFlag.LLM_RATE_LIMITED] = 1
+    with pytest.raises(ApplicationError) as exc_info:
+        await ActivityEnvironment().run(call_model)
+    assert exc_info.value.type == "ModelRateLimited"
+    assert exc_info.value.next_retry_delay == model_config.RATE_LIMIT_RETRY_AFTER
+    assert not exc_info.value.non_retryable
 
 
 async def test_gemini_throttling_waits_for_retry_after(monkeypatch):
